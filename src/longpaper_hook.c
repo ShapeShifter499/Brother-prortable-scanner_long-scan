@@ -266,6 +266,20 @@ static bool is_scan_cmd(const uint8_t *data, int length) {
  * The scan auto-stops when paper exits the ADF (ALLEND status), so the
  * br-y value you pass is only a safety ceiling — identical to Windows.
  */
+/* Print printable content of a USB command buffer to stderr. */
+static void log_cmd(const char *prefix, const uint8_t *buf, int len) {
+    fprintf(stderr, "[br5longpaper] %s (%d bytes): ", prefix, len);
+    for (int i = 0; i < len && i < 512; i++) {
+        uint8_t c = buf[i];
+        if (c == '\r') fprintf(stderr, "\\r");
+        else if (c == '\n') fprintf(stderr, "\\n");
+        else if (c == '\0') fprintf(stderr, "\\0");
+        else if (c < 32 || c > 126) fprintf(stderr, "[%02x]", c);
+        else fputc(c, stderr);
+    }
+    fprintf(stderr, "\n");
+}
+
 static int patch_cmd_long_paper(uint8_t *buf, int len, int max_len,
                                  int mode) {
     const char *ptype = (mode == 1) ? "LONGPAPER_WIDE" : "LONGPAPER_NARROW";
@@ -285,16 +299,10 @@ static int patch_cmd_long_paper(uint8_t *buf, int len, int max_len,
     if (r < 0 && r != -1) return -1;
     if (r > 0) len = r;
 
-    /* Set AREA=FULL so the scanner uses ADF-exit detection rather than
-     * stopping at the (possibly clamped) coordinate-based height limit. */
-    r = buf_replace_val(buf, len, max_len, "AREA=", "FULL");
-    if (r == -2) return -1;
-    if (r == -1) {
-        len = buf_insert_kv(buf, len, max_len, "AREA=", "FULL");
-        if (len < 0) return -1;
-    } else {
-        len = r;
-    }
+    /* NOTE: AREA=FULL was tried but caused "Document feeder jammed" errors.
+     * Removed — PTYPE=LONGPAPER_WIDE + LONG=ON may be sufficient.
+     * If the scanner still stops at 355mm, the height coordinate in the
+     * command needs to be increased (requires knowing exact byte format). */
 
     return len;
 }
@@ -322,6 +330,14 @@ int libusb_bulk_transfer(libusb_device_handle *dev_handle,
         return LIBUSB_ERROR_OTHER;
     }
 
+    /* Log ALL outgoing transfers when debug mode is on */
+    int debug = (getenv("BROTHER_SCAN_DEBUG") != NULL);
+
+    if (!(endpoint & LIBUSB_ENDPOINT_IN)) {
+        if (debug)
+            log_cmd("OUT raw", data, length);
+    }
+
     /* Only intercept outgoing (host→device) scan commands */
     if (g_mode && !(endpoint & LIBUSB_ENDPOINT_IN) &&
         is_scan_cmd(data, length)) {
@@ -337,13 +353,14 @@ int libusb_bulk_transfer(libusb_device_handle *dev_handle,
                     "[br5longpaper] USB patch: PTYPE=LONGPAPER_%s LONG=ON"
                     " (%d→%d bytes)\n",
                     g_mode == 1 ? "WIDE" : "NARROW", length, new_len);
+                if (debug)
+                    log_cmd("OUT patched", mod, new_len);
                 int rc = real_usb_bulk(dev_handle, endpoint, mod,
                                        new_len, actual_length, timeout);
                 free(mod);
                 return rc;
             }
             free(mod);
-            /* Patch failed — fall through to unmodified call */
             fprintf(stderr, "[br5longpaper] patch failed, using original"
                     " command\n");
         }
