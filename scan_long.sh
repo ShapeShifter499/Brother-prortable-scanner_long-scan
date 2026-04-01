@@ -144,13 +144,13 @@ fi
 # ── Convert PNM → requested format ───────────────────────────────
 if [[ "${OUTPUT_FILE}" == *.pnm || "${OUTPUT_FILE}" == *.ppm ]]; then
     mv "${PNM_TMP}" "${OUTPUT_FILE}"
-elif command -v convert >/dev/null 2>&1; then
-    echo "Converting to ${OUTPUT_FILE}..."
-    convert "${PNM_TMP}" "${OUTPUT_FILE}"
-    rm -f "${PNM_TMP}"
 elif command -v magick >/dev/null 2>&1; then
     echo "Converting to ${OUTPUT_FILE}..."
     magick "${PNM_TMP}" "${OUTPUT_FILE}"
+    rm -f "${PNM_TMP}"
+elif command -v convert >/dev/null 2>&1; then
+    echo "Converting to ${OUTPUT_FILE}..."
+    convert "${PNM_TMP}" "${OUTPUT_FILE}"
     rm -f "${PNM_TMP}"
 else
     # No converter available — keep the PNM

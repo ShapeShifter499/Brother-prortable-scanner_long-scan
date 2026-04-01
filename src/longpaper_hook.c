@@ -523,23 +523,32 @@ SANE_Status sane_control_option(SANE_Handle handle, SANE_Int option,
         option == g_br_y_opt_num && value) {
 
         SANE_Fixed requested = *(SANE_Fixed *)value;
-        double     mm        = SANE_UNFIX(requested);
+        g_br_y_user_val = requested;
 
-        if (requested > g_br_y_backend_max && g_br_y_backend_max > 0) {
-            /* Save the actual user request */
-            g_br_y_user_val = requested;
+        /* Always try to push 1829mm (DS-740D hardware max) into the
+         * backend during the option-setup phase.  brscan5 may accept
+         * any value (SANE_STATUS_GOOD) but clamp it internally; the
+         * SANE_INFO_INEXACT flag and a subsequent GET reveal the truth. */
+        SANE_Fixed hw_max  = SANE_FIX(1829.0);
+        SANE_Int   inf     = 0;
+        SANE_Status r = real_ctrl_opt(handle, option, action, &hw_max, &inf);
 
+        if (r == SANE_STATUS_GOOD) {
+            SANE_Fixed actual = 0;
+            real_ctrl_opt(handle, option, SANE_ACTION_GET_VALUE, &actual, NULL);
             fprintf(stderr,
-                "[br5longpaper] br-y %.1fmm > backend max %.1fmm:"
-                " clamping to backend max; LONG=ON will be injected.\n",
-                mm, SANE_UNFIX(g_br_y_backend_max));
-
-            /* Pass the backend's own max instead */
-            SANE_Fixed clamped = g_br_y_backend_max;
-            return real_ctrl_opt(handle, option, action, &clamped, info);
+                "[br5longpaper] br-y SET: requested %.1fmm,"
+                " pushed 1829mm → stored %.1fmm%s\n",
+                SANE_UNFIX(requested), SANE_UNFIX(actual),
+                (inf & SANE_INFO_INEXACT) ? " [CLAMPED by backend]" : " [exact]");
+            if (info) *info = inf;
+            return SANE_STATUS_GOOD;
         }
 
-        g_br_y_user_val = requested;
+        /* Backend rejected 1829mm outright — pass the original value */
+        fprintf(stderr,
+            "[br5longpaper] br-y SET: 1829mm rejected (status %d),"
+            " passing %.1fmm\n", r, SANE_UNFIX(requested));
     }
 
     return real_ctrl_opt(handle, option, action, value, info);
@@ -627,9 +636,16 @@ SANE_Status sane_start(SANE_Handle handle) {
             r = real_ctrl_opt(handle, g_br_y_opt_num,
                               SANE_ACTION_SET_VALUE, &target, &info);
             if (r == SANE_STATUS_GOOD) {
+                /* Read back what brscan5 actually stored */
+                SANE_Fixed actual = 0;
+                real_ctrl_opt(handle, g_br_y_opt_num,
+                              SANE_ACTION_GET_VALUE, &actual, NULL);
                 fprintf(stderr,
-                    "[br5longpaper] sane_start: br-y pushed to %.0fmm"
-                    " (backend accepted)\n", mm);
+                    "[br5longpaper] sane_start: br-y push %.0fmm →"
+                    " stored %.1fmm%s (info=0x%x)\n",
+                    mm, SANE_UNFIX(actual),
+                    (info & SANE_INFO_INEXACT) ? " [CLAMPED]" : " [exact]",
+                    (unsigned)info);
                 pushed = true;
             }
         }
