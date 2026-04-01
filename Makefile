@@ -1,18 +1,19 @@
-# Makefile for libbr5longpaper.so
+# Makefile for libbr5longpaper.so and libsane-brother5lp.so.1
 #
 # Build:               make
-# Install (manual):    make install   (copies .so to /usr/local/lib)
 # AUR package:         cd pkg && makepkg -si
+# Manual install:      sudo make install
 # Clean:               make clean
 # Check:               make check-deps
 #
-# Preferred install method is the AUR package (pkg/PKGBUILD), which:
-#   1. Installs libbr5longpaper.so to /usr/lib/
-#   2. Uses patchelf to add it as a NEEDED dep of libsane-brother5.so so it
-#      loads only for brscan5-using processes (not system-wide)
-#   3. Installs a pacman hook to re-inject after brscan5 upgrades
-#   4. Overrides Simple Scan's .desktop file with LD_PRELOAD for SANE hooks
-#   5. Installs brother-scan-wrap for other GUI scanning apps
+# Two outputs:
+#   libbr5longpaper.so         — LD_PRELOAD hook for CLI use (scan_long.sh)
+#   libsane-brother5lp.so.1    — SANE backend for GUI apps (Simple Scan etc.)
+#
+# The SANE backend is the preferred integration for GUI apps.  It registers
+# as 'brother5lp' in /etc/sane.d/dll.conf; scanning apps then see the
+# scanner as "Brother DS-740D [Long Paper]" alongside the regular device.
+# No LD_PRELOAD or patchelf required.
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC -shared
@@ -20,9 +21,13 @@ LDFLAGS ?= -ldl -lpthread
 
 PREFIX  ?= /usr/local
 LIBDIR  ?= $(PREFIX)/lib
+SANEDIR ?= $(LIBDIR)/sane
 
-SRCS = src/longpaper_hook.c
-LIB  = libbr5longpaper.so
+SRCS_HOOK    = src/longpaper_hook.c
+SRCS_BACKEND = src/sane_backend.c
+
+LIB_HOOK    = libbr5longpaper.so
+LIB_BACKEND = libsane-brother5lp.so.1
 
 # Try pkg-config first; fall back to common paths
 LIBUSB_CFLAGS  := $(shell pkg-config --cflags libusb-1.0 2>/dev/null \
@@ -30,47 +35,41 @@ LIBUSB_CFLAGS  := $(shell pkg-config --cflags libusb-1.0 2>/dev/null \
 LIBUSB_LDFLAGS := $(shell pkg-config --libs   libusb-1.0 2>/dev/null \
                            || echo -lusb-1.0)
 
-# SANE headers are typically in /usr/include/sane
-SANE_CFLAGS    := -I/usr/include/sane
+SANE_CFLAGS := -I/usr/include/sane
 
 ALL_CFLAGS  = $(CFLAGS) $(LIBUSB_CFLAGS) $(SANE_CFLAGS)
 ALL_LDFLAGS = $(LDFLAGS) $(LIBUSB_LDFLAGS)
 
-.PHONY: all install clean check-deps
+.PHONY: all hook backend install clean check-deps
 
-all: $(LIB)
+all: hook backend
 
-$(LIB): $(SRCS) | check-deps
-	$(CC) $(ALL_CFLAGS) -Wl,-soname,$(LIB) -o $@ $^ $(ALL_LDFLAGS)
-	@echo ""
-	@echo "Built $(LIB)."
-	@echo ""
-	@echo "Install via AUR package (recommended):"
-	@echo "  cd pkg && makepkg -si"
-	@echo ""
-	@echo "Or manual install + CLI use:"
-	@echo "  sudo make install"
-	@echo "  ./scan_long.sh --output scan.png"
+hook: $(LIB_HOOK)
 
-# Manual install — copies the .so to /usr/local/lib.
-# For system-wide GUI support, use the AUR package instead.
-install: $(LIB)
-	install -Dm755 $(LIB) $(DESTDIR)$(LIBDIR)/$(LIB)
-	install -Dm755 scan_long.sh $(DESTDIR)$(PREFIX)/bin/scan-long
-	@echo "Installed to $(LIBDIR)/$(LIB)"
+backend: $(LIB_BACKEND)
+
+$(LIB_HOOK): $(SRCS_HOOK) | check-deps
+	$(CC) $(ALL_CFLAGS) -Wl,-soname,$(LIB_HOOK) -o $@ $^ $(ALL_LDFLAGS)
+	@echo "Built $(LIB_HOOK)  (LD_PRELOAD hook for CLI / scan_long.sh)"
+
+$(LIB_BACKEND): $(SRCS_BACKEND) | check-deps
+	$(CC) $(ALL_CFLAGS) -Wl,-soname,$(LIB_BACKEND) -o $@ $^ $(ALL_LDFLAGS)
+	@echo "Built $(LIB_BACKEND)  (SANE backend — add 'brother5lp' to /etc/sane.d/dll.conf)"
+
+install: all
+	install -Dm755 $(LIB_HOOK)    $(DESTDIR)$(LIBDIR)/$(LIB_HOOK)
+	install -Dm755 $(LIB_BACKEND) $(DESTDIR)$(SANEDIR)/$(LIB_BACKEND)
+	ln -sf $(LIB_BACKEND) $(DESTDIR)$(SANEDIR)/libsane-brother5lp.so
+	install -Dm755 scan_long.sh   $(DESTDIR)$(PREFIX)/bin/scan-long
 	@echo ""
-	@echo "CLI use (explicit mode):"
-	@echo "  BROTHER_LONG_MODE=WIDE LD_PRELOAD=$(LIBDIR)/$(LIB) scan-long --output scan.png"
+	@echo "Installed.  To activate the SANE backend:"
+	@echo "  echo 'brother5lp' | sudo tee -a /etc/sane.d/dll.conf"
 	@echo ""
-	@echo "GUI use (wrap any SANE app):"
-	@echo "  LD_PRELOAD=$(LIBDIR)/$(LIB) simple-scan"
-	@echo "  LD_PRELOAD=$(LIBDIR)/$(LIB) xsane"
-	@echo ""
-	@echo "For automatic injection without LD_PRELOAD, use the AUR package:"
-	@echo "  cd pkg && makepkg -si"
+	@echo "Then open Simple Scan / XSane and select"
+	@echo "  'Brother DS-740D [Long Paper]'"
 
 clean:
-	rm -f $(LIB)
+	rm -f $(LIB_HOOK) $(LIB_BACKEND)
 
 check-deps:
 	@echo "Checking build dependencies..."
@@ -88,3 +87,4 @@ check-deps:
 	      echo "  Debian: sudo apt install libusb-1.0-0-dev"; \
 	      exit 1; }
 	@echo "  OK"
+

@@ -1,11 +1,34 @@
+DLL_CONF=/etc/sane.d/dll.conf
+BACKEND=brother5lp
+
+_add_backend() {
+    if [[ ! -f "$DLL_CONF" ]]; then
+        echo "brscan5-longpaper: $DLL_CONF not found — is sane installed?" >&2
+        return
+    fi
+    if grep -qxF "$BACKEND" "$DLL_CONF" 2>/dev/null; then
+        echo "brscan5-longpaper: $BACKEND already in $DLL_CONF" >&2
+        return
+    fi
+    echo "$BACKEND" >> "$DLL_CONF"
+    echo "brscan5-longpaper: registered '$BACKEND' in $DLL_CONF" >&2
+    echo "  Open Simple Scan / XSane and select:" >&2
+    echo "    'Brother [model] [Long Paper]'" >&2
+}
+
+_remove_backend() {
+    sed -i "/^${BACKEND}$/d" "$DLL_CONF" 2>/dev/null || true
+    echo "brscan5-longpaper: removed '$BACKEND' from $DLL_CONF" >&2
+}
+
 post_install() {
-    /usr/lib/brscan5-longpaper/br5longpaper-inject.sh || true
+    _add_backend
 }
 
 post_upgrade() {
-    /usr/lib/brscan5-longpaper/br5longpaper-inject.sh || true
+    _add_backend
 }
 
 pre_remove() {
-    /usr/lib/brscan5-longpaper/br5longpaper-uninject.sh || true
+    _remove_backend
 }
