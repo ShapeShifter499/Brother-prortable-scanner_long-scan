@@ -213,59 +213,28 @@ static int buf_insert_kv(uint8_t *buf, int len, int max_len,
 
 /* ── Command detection ─────────────────────────────────────────── */
 
+/* Returns true if buf starts with the given literal header. */
+static bool cmd_is(const uint8_t *buf, int len, const char *header) {
+    int hlen = (int)strlen(header);
+    return len >= hlen && memcmp(buf, header, hlen) == 0;
+}
+
 /*
  * Returns true if the outgoing USB payload looks like a brscan5 scan
- * command (contains one of the known text parameter keys).
+ * command that we should patch (SSP or XSC, not CKD status checks).
  */
 static bool is_scan_cmd(const uint8_t *data, int length) {
     if (length < 6 || length > MAX_CMD_BUF) return false;
-    static const char * const probes[] =
-        { "RESO=", "CLR=", "PTYPE=", "PSRC=", "AREA=", NULL };
-    for (int i = 0; probes[i]; i++)
-        if (buf_find(data, length, probes[i]))
-            return true;
+    /* Target the two commands that control the scan: SSP (parameters)
+     * and XSC (execute with area coordinates).  CKD is just a source
+     * check and must not be patched. */
+    if (cmd_is(data, length, "\x1bSSP\n")) return true;
+    if (cmd_is(data, length, "\x1bXSC\n")) return true;
     return false;
 }
 
 /* ── Long paper command patch ──────────────────────────────────── */
 
-/*
- * Modify a brscan5 scan command in-place to request long paper scanning.
- *
- *   buf / len   — command to modify (already copied)
- *   max_len     — allocated size
- *   mode        — 1 = WIDE, 2 = NARROW
- *
- * Returns new length, or -1 on failure (caller should use original).
- *
- * What this sets and why:
- *
- *   PTYPE=LONGPAPER_WIDE (or NARROW)
- *     Tells the scanner "this is a long document scan."  The scanner
- *     switches from coordinate-based stopping to ADF-exit detection:
- *     it scans until the paper physically exits the feed rollers, then
- *     sends GetScanStatus()=ALLEND — identical to Windows auto-stop.
- *
- *   LONG=ON
- *     Explicit long-paper enable flag (bool, from MakeLongPaperModeString).
- *     Redundant with PTYPE=LONGPAPER_* but included for safety.
- *
- *   AREA=FULL
- *     Overrides coordinate-based scan area height ("scan the whole document,
- *     ignoring the height coordinate").  Without this, the backend clamps
- *     br-y to ~355mm and encodes that into the scan area coordinates;
- *     the scanner would stop at 355mm even with LONG=ON set.
- *     AREA=FULL is most likely what the Windows driver uses for long paper
- *     because it lets PTYPE/LONG flags drive end-of-scan instead of a fixed
- *     pixel coordinate.
- *
- * Hardware maximums (enforced by the scanner regardless of br-y ceiling):
- *   DS-740D:  72 inches (1828.8 mm) per Brother specification
- *   ADS-1200: verify with Windows driver or scanner manual
- *
- * The scan auto-stops when paper exits the ADF (ALLEND status), so the
- * br-y value you pass is only a safety ceiling — identical to Windows.
- */
 /* Print printable content of a USB command buffer to stderr. */
 static void log_cmd(const char *prefix, const uint8_t *buf, int len) {
     fprintf(stderr, "[br5longpaper] %s (%d bytes): ", prefix, len);
@@ -280,30 +249,120 @@ static void log_cmd(const char *prefix, const uint8_t *buf, int len) {
     fprintf(stderr, "\n");
 }
 
+/*
+ * Patch the XSC command's AREA=x1,y1,x2,y2 by replacing y2 with a large
+ * value so the scanner isn't told to stop at the normal-paper height.
+ * The scanner's hardware limit (72" on the DS-740D) still applies.
+ */
+static int patch_xsc_area(uint8_t *buf, int len, int max_len) {
+    uint8_t *p = buf_find(buf, len, "AREA=");
+    if (!p) return len;                          /* no AREA= key, no change */
+
+    uint8_t *vs = p + 5;                         /* start of value */
+    uint8_t *ve = vs;
+    while (ve < buf + len && *ve != '\r' && *ve != '\n' && *ve != '\0')
+        ve++;
+
+    int vlen = (int)(ve - vs);
+    if (vlen <= 0 || vlen >= 64) return len;
+
+    char val[64];
+    memcpy(val, vs, vlen);
+    val[vlen] = '\0';
+
+    long x1, y1, x2, y2;
+    if (sscanf(val, "%ld,%ld,%ld,%ld", &x1, &y1, &x2, &y2) != 4)
+        return len;                              /* unexpected format, skip */
+
+    /* Replace y2 with a value well past the scanner's hardware maximum.
+     * DS-740D max = 72 inches; at 600 dpi that is 43 200 px.  We use
+     * 999999 so the scanner's own ADF-exit (ALLEND) logic always fires
+     * first regardless of resolution.                                     */
+    char newval[64];
+    int newvlen = snprintf(newval, sizeof(newval), "%ld,%ld,%ld,999999",
+                           x1, y1, x2);
+
+    int delta = newvlen - vlen;
+    if (len + delta > max_len) return -1;
+
+    memmove(vs + newvlen, ve, (buf + len) - ve);
+    memcpy(vs, newval, newvlen);
+
+    fprintf(stderr,
+        "[br5longpaper] XSC AREA y2: %ld → 999999 (was %.1fmm at current dpi)\n",
+        y2, (double)y2 / 300.0 * 25.4);
+
+    return len + delta;
+}
+
+/*
+ * Modify a brscan5 scan command in-place to request long paper scanning.
+ *
+ *   buf / len   — command to modify (already copied)
+ *   max_len     — allocated size
+ *   mode        — 1 = WIDE, 2 = NARROW
+ *
+ * Returns new length (>= original), or -1 on failure (caller uses original).
+ *
+ * Command-aware behaviour:
+ *
+ *   SSP — scan parameter setup:
+ *     • PTYPE=NORMAL → LONGPAPER_WIDE or LONGPAPER_NARROW
+ *     • LONG=OFF → LONG=ON  (uses replace, not insert, to handle existing key)
+ *
+ *   XSC — execute scan with area coordinates:
+ *     • AREA=x1,y1,x2,y2 → replace y2 with 999999 so the hardware-limited
+ *       ADF-exit detection (ALLEND) governs the stop instead of a pixel count
+ *       that corresponds to ~355 mm.
+ *
+ *   CKD — source/capability check: left untouched (not a scan command).
+ *
+ * Auto-stop behaviour:
+ *   With PTYPE=LONGPAPER_WIDE/NARROW and LONG=ON the scanner switches from
+ *   coordinate-based stopping to ADF-exit detection: it scans until the
+ *   paper physically exits the feed rollers, then sends ALLEND — identical
+ *   to how the Windows driver works.
+ *
+ * Hardware maximums (scanner enforces regardless of software values):
+ *   DS-740D:  72 inches (1828.8 mm)
+ *   ADS-1200: verify with Brother specification / Windows driver
+ */
 static int patch_cmd_long_paper(uint8_t *buf, int len, int max_len,
                                  int mode) {
-    const char *ptype = (mode == 1) ? "LONGPAPER_WIDE" : "LONGPAPER_NARROW";
+    /* XSC: extend scan-area height so the scanner isn't told to stop at
+     * the normal-paper pixel limit (~355 mm).                             */
+    if (cmd_is(buf, len, "\x1bXSC\n"))
+        return patch_xsc_area(buf, len, max_len);
 
-    /* Set PTYPE= to the long paper type (replace existing value or insert) */
-    int r = buf_replace_val(buf, len, max_len, "PTYPE=", ptype);
-    if (r == -2) return -1;
-    if (r == -1) {
-        len = buf_insert_kv(buf, len, max_len, "PTYPE=", ptype);
-        if (len < 0) return -1;
-    } else {
-        len = r;
+    /* SSP: set PTYPE and enable LONG flag. */
+    if (cmd_is(buf, len, "\x1bSSP\n")) {
+        const char *ptype = (mode == 1) ? "LONGPAPER_WIDE" : "LONGPAPER_NARROW";
+
+        /* Replace or insert PTYPE= */
+        int r = buf_replace_val(buf, len, max_len, "PTYPE=", ptype);
+        if (r == -2) return -1;
+        if (r == -1) {
+            len = buf_insert_kv(buf, len, max_len, "PTYPE=", ptype);
+            if (len < 0) return -1;
+        } else {
+            len = r;
+        }
+
+        /* Replace LONG= value (OFF → ON) or insert if absent */
+        r = buf_replace_val(buf, len, max_len, "LONG=", "ON");
+        if (r == -2) return -1;
+        if (r == -1) {
+            r = buf_insert_kv(buf, len, max_len, "LONG=", "ON");
+            if (r < 0) return -1;
+            len = r;
+        } else {
+            len = r;
+        }
+
+        return len;
     }
 
-    /* Enable long paper flag */
-    r = buf_insert_kv(buf, len, max_len, "LONG=", "ON");
-    if (r < 0 && r != -1) return -1;
-    if (r > 0) len = r;
-
-    /* NOTE: AREA=FULL was tried but caused "Document feeder jammed" errors.
-     * Removed — PTYPE=LONGPAPER_WIDE + LONG=ON may be sufficient.
-     * If the scanner still stops at 355mm, the height coordinate in the
-     * command needs to be increased (requires knowing exact byte format). */
-
+    /* Unknown command type that slipped through is_scan_cmd — leave alone. */
     return len;
 }
 
@@ -349,10 +408,13 @@ int libusb_bulk_transfer(libusb_device_handle *dev_handle,
             int new_len = patch_cmd_long_paper(mod, length,
                                                length + extra, g_mode);
             if (new_len > 0) {
+                const char *cmd_type =
+                    cmd_is(mod, length, "\x1bSSP\n") ? "SSP" :
+                    cmd_is(mod, length, "\x1bXSC\n") ? "XSC" : "???";
                 fprintf(stderr,
-                    "[br5longpaper] USB patch: PTYPE=LONGPAPER_%s LONG=ON"
-                    " (%d→%d bytes)\n",
-                    g_mode == 1 ? "WIDE" : "NARROW", length, new_len);
+                    "[br5longpaper] USB patch %s: LONGPAPER_%s (%d→%d bytes)\n",
+                    cmd_type, g_mode == 1 ? "WIDE" : "NARROW",
+                    length, new_len);
                 if (debug)
                     log_cmd("OUT patched", mod, new_len);
                 int rc = real_usb_bulk(dev_handle, endpoint, mod,
