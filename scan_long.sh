@@ -104,10 +104,12 @@ SCAN_ARGS=(
     --device  "${DEVICE}"
     --resolution "${RESOLUTION}"
     --mode    "${COLOR_MODE}"
-    --br-y    "${LENGTH_MM}"
     --format  tiff
     -o        "${OUTPUT_FILE}"
 )
+# Note: DS-740D does not expose --br-y; scan length is determined by the
+# USB-level patch (PTYPE=LONGPAPER_WIDE + LONG=ON + AREA=FULL) and the
+# scanner hardware auto-stops when paper exits the ADF.
 
 # ADF source (DS-740D uses left-aligned; ADS-1200 may differ)
 SCAN_ARGS+=(--source "Automatic Document Feeder(left aligned)")
