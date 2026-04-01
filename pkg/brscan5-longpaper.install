@@ -1,0 +1,11 @@
+post_install() {
+    /usr/lib/brscan5-longpaper/br5longpaper-inject.sh || true
+}
+
+post_upgrade() {
+    /usr/lib/brscan5-longpaper/br5longpaper-inject.sh || true
+}
+
+pre_remove() {
+    /usr/lib/brscan5-longpaper/br5longpaper-uninject.sh || true
+}

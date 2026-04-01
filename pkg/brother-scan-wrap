@@ -1,0 +1,36 @@
+#!/bin/bash
+# brother-scan-wrap — run any SANE scanning app with Brother long paper support.
+#
+# The patchelf injection handles the low-level USB and C++ hooks automatically
+# for any process that loads brscan5.  This wrapper adds the SANE API hooks
+# (auto-detect, streaming, range extension) for apps that need them.
+#
+# Usage:
+#   brother-scan-wrap simple-scan
+#   brother-scan-wrap xsane
+#   brother-scan-wrap gscan2pdf
+#   brother-scan-wrap gimp
+#
+# Or with an explicit mode (overrides auto-detect from br-y):
+#   BROTHER_LONG_MODE=WIDE brother-scan-wrap simple-scan
+#   BROTHER_LONG_MODE=NARROW brother-scan-wrap xsane
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: brother-scan-wrap <app> [args...]" >&2
+    echo "" >&2
+    echo "Examples:" >&2
+    echo "  brother-scan-wrap simple-scan" >&2
+    echo "  brother-scan-wrap xsane" >&2
+    echo "  brother-scan-wrap gscan2pdf" >&2
+    exit 1
+fi
+
+LIB=/usr/lib/libbr5longpaper.so
+
+if [[ ! -f "$LIB" ]]; then
+    echo "brother-scan-wrap: $LIB not found — is brscan5-longpaper installed?" >&2
+    exit 1
+fi
+
+export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$LIB"
+exec "$@"

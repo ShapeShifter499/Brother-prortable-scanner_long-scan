@@ -1,12 +1,18 @@
 # Makefile for libbr5longpaper.so
 #
-# Build:             make
-# Install:           make install          (copies .so to /usr/local/lib)
-# System-wide shim:  make install-preload  (adds to /etc/ld.so.preload so all
-#                                           SANE GUI apps use the hook)
-# Remove shim:       make uninstall-preload
-# Clean:             make clean
-# Check:             make check-deps
+# Build:               make
+# Install (manual):    make install   (copies .so to /usr/local/lib)
+# AUR package:         cd pkg && makepkg -si
+# Clean:               make clean
+# Check:               make check-deps
+#
+# Preferred install method is the AUR package (pkg/PKGBUILD), which:
+#   1. Installs libbr5longpaper.so to /usr/lib/
+#   2. Uses patchelf to add it as a NEEDED dep of libsane-brother5.so so it
+#      loads only for brscan5-using processes (not system-wide)
+#   3. Installs a pacman hook to re-inject after brscan5 upgrades
+#   4. Overrides Simple Scan's .desktop file with LD_PRELOAD for SANE hooks
+#   5. Installs brother-scan-wrap for other GUI scanning apps
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC -shared
@@ -30,58 +36,38 @@ SANE_CFLAGS    := -I/usr/include/sane
 ALL_CFLAGS  = $(CFLAGS) $(LIBUSB_CFLAGS) $(SANE_CFLAGS)
 ALL_LDFLAGS = $(LDFLAGS) $(LIBUSB_LDFLAGS)
 
-PRELOAD_FILE ?= /etc/ld.so.preload
-
-.PHONY: all install install-preload uninstall-preload clean check-deps
+.PHONY: all install clean check-deps
 
 all: $(LIB)
 
 $(LIB): $(SRCS) | check-deps
-	$(CC) $(ALL_CFLAGS) -o $@ $^ $(ALL_LDFLAGS)
+	$(CC) $(ALL_CFLAGS) -Wl,-soname,$(LIB) -o $@ $^ $(ALL_LDFLAGS)
 	@echo ""
 	@echo "Built $(LIB)."
 	@echo ""
-	@echo "Quick test (check that br-y range is extended):"
-	@echo "  BROTHER_LONG_MODE=WIDE LD_PRELOAD=\$$(pwd)/$(LIB) \\"
-	@echo "    scanimage --device 'brother5:...' --help 2>&1 | grep 'br-y'"
+	@echo "Install via AUR package (recommended):"
+	@echo "  cd pkg && makepkg -si"
 	@echo ""
-	@echo "Scan a long document:"
-	@echo "  ./scan_long.sh --length 2000 --output scan.tiff"
+	@echo "Or manual install + CLI use:"
+	@echo "  sudo make install"
+	@echo "  ./scan_long.sh --output scan.png"
 
+# Manual install — copies the .so to /usr/local/lib.
+# For system-wide GUI support, use the AUR package instead.
 install: $(LIB)
 	install -Dm755 $(LIB) $(DESTDIR)$(LIBDIR)/$(LIB)
+	install -Dm755 scan_long.sh $(DESTDIR)$(PREFIX)/bin/scan-long
 	@echo "Installed to $(LIBDIR)/$(LIB)"
 	@echo ""
-	@echo "To enable for all SANE GUI apps (Simple Scan, GIMP, etc.):"
-	@echo "  make install-preload"
-
-# install-preload — add the .so to /etc/ld.so.preload so every process
-# that links libsane or libusb picks up the hook automatically.  This is
-# what allows GUI scanners (Simple Scan, GIMP, gscan2pdf, etc.) to use
-# long paper mode without needing LD_PRELOAD set manually.
-#
-# Safe to use on single-Brother-scanner setups.  The hook activates long
-# mode only when br-y > 300 mm is requested; all other scans pass through.
-install-preload: install
-	@if grep -qF "$(LIBDIR)/$(LIB)" "$(PRELOAD_FILE)" 2>/dev/null; then \
-	    echo "$(LIBDIR)/$(LIB) is already in $(PRELOAD_FILE) — skipped."; \
-	else \
-	    echo "$(LIBDIR)/$(LIB)" | sudo tee -a "$(PRELOAD_FILE)"; \
-	    echo ""; \
-	    echo "System-wide shim installed."; \
-	    echo "Long paper mode now activates automatically in any SANE app"; \
-	    echo "when br-y > 300 mm is requested (no env vars needed)."; \
-	    echo ""; \
-	    echo "To remove:  make uninstall-preload"; \
-	fi
-
-uninstall-preload:
-	@if grep -qF "$(LIBDIR)/$(LIB)" "$(PRELOAD_FILE)" 2>/dev/null; then \
-	    sudo sed -i "\|$(LIBDIR)/$(LIB)|d" "$(PRELOAD_FILE)"; \
-	    echo "Removed $(LIBDIR)/$(LIB) from $(PRELOAD_FILE)."; \
-	else \
-	    echo "$(LIBDIR)/$(LIB) not found in $(PRELOAD_FILE) — nothing to do."; \
-	fi
+	@echo "CLI use (explicit mode):"
+	@echo "  BROTHER_LONG_MODE=WIDE LD_PRELOAD=$(LIBDIR)/$(LIB) scan-long --output scan.png"
+	@echo ""
+	@echo "GUI use (wrap any SANE app):"
+	@echo "  LD_PRELOAD=$(LIBDIR)/$(LIB) simple-scan"
+	@echo "  LD_PRELOAD=$(LIBDIR)/$(LIB) xsane"
+	@echo ""
+	@echo "For automatic injection without LD_PRELOAD, use the AUR package:"
+	@echo "  cd pkg && makepkg -si"
 
 clean:
 	rm -f $(LIB)

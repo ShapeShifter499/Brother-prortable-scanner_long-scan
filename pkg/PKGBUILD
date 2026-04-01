@@ -1,0 +1,61 @@
+# Maintainer: ShapeShifter499
+pkgname=brscan5-longpaper-git
+pkgver=r1.0
+pkgrel=1
+pkgdesc="Long paper scanning for Brother DS-740D and ADS-1200 via brscan5 on Linux"
+arch=('x86_64')
+url="https://github.com/shapeshifter499/brother-prortable-scanner_long-scan"
+license=('GPL2')
+depends=('brscan5' 'libusb' 'sane' 'patchelf')
+makedepends=('gcc' 'libusb' 'sane')
+provides=('brscan5-longpaper')
+conflicts=('brscan5-longpaper')
+install=brscan5-longpaper.install
+source=("$pkgname::git+$url")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$pkgname"
+    make
+}
+
+package() {
+    cd "$pkgname"
+
+    # ── Hook library ──────────────────────────────────────────────────────
+    # Installed to /usr/lib so the dynamic linker finds it by bare SONAME
+    # after patchelf adds it as a NEEDED entry in libsane-brother5.so.
+    install -Dm755 libbr5longpaper.so \
+        "$pkgdir/usr/lib/libbr5longpaper.so"
+
+    # ── Injection / removal scripts ───────────────────────────────────────
+    install -Dm755 pkg/br5longpaper-inject.sh \
+        "$pkgdir/usr/lib/brscan5-longpaper/br5longpaper-inject.sh"
+    install -Dm755 pkg/br5longpaper-uninject.sh \
+        "$pkgdir/usr/lib/brscan5-longpaper/br5longpaper-uninject.sh"
+
+    # ── Pacman hook — re-injects after brscan5 is upgraded ────────────────
+    install -Dm644 pkg/brscan5-longpaper.hook \
+        "$pkgdir/usr/share/libalpm/hooks/brscan5-longpaper.hook"
+
+    # ── Simple Scan desktop override ──────────────────────────────────────
+    # /usr/local/share/applications/ takes XDG precedence over /usr/share/,
+    # so this silently overrides the stock Simple Scan launcher to add
+    # LD_PRELOAD for the SANE-level hooks without touching the system file.
+    install -Dm644 pkg/org.gnome.SimpleScan.desktop \
+        "$pkgdir/usr/local/share/applications/org.gnome.SimpleScan.desktop"
+
+    # ── Generic wrapper for other SANE apps ───────────────────────────────
+    # Usage: brother-scan-wrap xsane / brother-scan-wrap gscan2pdf / etc.
+    install -Dm755 pkg/brother-scan-wrap \
+        "$pkgdir/usr/bin/brother-scan-wrap"
+
+    # ── CLI scan helper ───────────────────────────────────────────────────
+    install -Dm755 scan_long.sh \
+        "$pkgdir/usr/bin/scan-long"
+}
