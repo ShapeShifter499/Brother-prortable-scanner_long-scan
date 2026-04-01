@@ -76,6 +76,10 @@
  * USB patch regardless of whether PTYPE already has a long value.   */
 #define LONG_TRIGGER_MM     300.0
 
+/* br-x below this threshold triggers NARROW mode in auto-detect.
+ * 80 mm thermal receipt paper is narrow; A4/Letter (210–216 mm) is wide. */
+#define NARROW_WIDTH_MM     110.0
+
 /* Maximum USB command buffer we will modify (bytes).
  * Commands larger than this are passed through unmodified.           */
 #define MAX_CMD_BUF         8192
@@ -121,10 +125,22 @@ static cpp_setheight_fn   real_devimg_sh     = NULL; /* DeviceImageJpeg::SetHeig
 static cpp_setheight_fn   real_decodeparam_sh= NULL; /* DecodeParameter::SetHeight  */
 static cpp_appendwhite_fn real_append_white  = NULL; /* BitmapImage::AppendWhiteLines */
 
-/* Per-handle tracking of br-y state (single-scanner assumption) */
-static SANE_Fixed  g_br_y_user_val    = 0;  /* what the user requested */
-static SANE_Fixed  g_br_y_backend_max = 0;  /* backend's hard limit    */
-static SANE_Int    g_br_y_opt_num     = -1; /* SANE option number      */
+/* Per-handle tracking of br-y/br-x/resolution state (single-scanner) */
+static SANE_Fixed  g_br_y_user_val    = 0;   /* requested br-y (mm, SANE_Fixed) */
+static SANE_Fixed  g_br_y_backend_max = 0;   /* backend's hard limit            */
+static SANE_Int    g_br_y_opt_num     = -1;  /* SANE option number              */
+
+static SANE_Int    g_br_x_opt_num     = -1;  /* SANE option number for br-x     */
+static SANE_Fixed  g_br_x_user_val    = 0;   /* requested width (mm, SANE_Fixed)*/
+
+/* Resolution is tracked from sane_control_option and used to convert the
+ * user-requested br-y from mm to pixels when building the XSC AREA y2.  */
+static SANE_Int    g_resolution_opt_num = -1;
+static int         g_resolution         = 300; /* DPI; default until tracked     */
+
+/* True when g_mode was locked via BROTHER_LONG_MODE env var; in that case
+ * the br-y auto-detect logic is skipped.                                  */
+static bool        g_mode_explicit = false;
 
 /* Override descriptor returned when long mode is active */
 static SANE_Option_Descriptor g_br_y_desc;
@@ -157,10 +173,17 @@ static void do_init(void) {
     real_append_white   = (cpp_appendwhite_fn) dlsym(RTLD_NEXT,
                                                     "_ZN11BitmapImage16AppendWhiteLinesEj");
 
+    g_mode_explicit = (g_mode != 0); /* lock mode if set via env var */
+    g_resolution    = 300;           /* safe default until sane_control_option tells us */
+
     if (g_mode) {
         fprintf(stderr,
-            "[br5longpaper] active: mode=%s, max_br_y=%.0fmm\n",
+            "[br5longpaper] active: mode=%s (explicit), max_br_y=%.0fmm\n",
             g_mode == 1 ? "WIDE" : "NARROW", LONG_PAPER_MAX_MM);
+    } else {
+        fprintf(stderr,
+            "[br5longpaper] loaded; auto-detect armed"
+            " (will activate when br-y > %.0fmm)\n", LONG_TRIGGER_MM);
     }
 
     g_initialized = true;
@@ -276,9 +299,12 @@ static void log_cmd(const char *prefix, const uint8_t *buf, int len) {
 }
 
 /*
- * Patch the XSC command's AREA=x1,y1,x2,y2 by replacing y2 with a large
- * value so the scanner isn't told to stop at the normal-paper height.
+ * Patch the XSC command's AREA=x1,y1,x2,y2 by replacing y2 with a value
+ * derived from the user's requested br-y at the tracked resolution.
  * The scanner's hardware limit (72" on the DS-740D) still applies.
+ *
+ * If no br-y was set by the frontend (e.g. scan_long.sh / CLI use), we
+ * fall back to 999999 so the scanner always relies on ALLEND (paper-exit).
  */
 static int patch_xsc_area(uint8_t *buf, int len, int max_len) {
     uint8_t *p = buf_find(buf, len, "AREA=");
@@ -300,24 +326,34 @@ static int patch_xsc_area(uint8_t *buf, int len, int max_len) {
     if (sscanf(val, "%ld,%ld,%ld,%ld", &x1, &y1, &x2, &y2) != 4)
         return len;                              /* unexpected format, skip */
 
-    /* Replace y2 with a value well past the scanner's hardware maximum.
-     * DS-740D max = 72 inches; at 600 dpi that is 43 200 px.  We use
-     * 999999 so the scanner's own ADF-exit (ALLEND) logic always fires
-     * first regardless of resolution.                                     */
+    /* Compute the y2 ceiling from the frontend-requested br-y.
+     * g_resolution is tracked from sane_control_option; defaults to 300.
+     * If no br-y was set by the frontend, fall back to 999999 so the
+     * scanner's own ALLEND (paper-exit) signal is always the stop trigger. */
+    long y2_new;
+    if (g_br_y_user_val > 0) {
+        double br_y_mm  = SANE_UNFIX(g_br_y_user_val);
+        long   y2_calc  = (long)(br_y_mm / 25.4 * g_resolution + 0.5);
+        y2_new = (y2_calc < 999999) ? y2_calc : 999999;
+        fprintf(stderr,
+            "[br5longpaper] XSC AREA y2: %ld → %ld (%.1fmm at %d dpi)\n",
+            y2, y2_new, br_y_mm, g_resolution);
+    } else {
+        y2_new = 999999;
+        fprintf(stderr,
+            "[br5longpaper] XSC AREA y2: %ld → %ld (no br-y set; using scanner ALLEND)\n",
+            y2, y2_new);
+    }
+
     char newval[64];
-    int newvlen = snprintf(newval, sizeof(newval), "%ld,%ld,%ld,999999",
-                           x1, y1, x2);
+    int newvlen = snprintf(newval, sizeof(newval), "%ld,%ld,%ld,%ld",
+                           x1, y1, x2, y2_new);
 
     int delta = newvlen - vlen;
     if (len + delta > max_len) return -1;
 
     memmove(vs + newvlen, ve, (buf + len) - ve);
     memcpy(vs, newval, newvlen);
-
-    fprintf(stderr,
-        "[br5longpaper] XSC AREA y2: %ld → 999999 (was %.1fmm at current dpi)\n",
-        y2, (double)y2 / 300.0 * 25.4);
-
     return len + delta;
 }
 
@@ -486,12 +522,22 @@ sane_get_option_descriptor(SANE_Handle handle, SANE_Int option) {
 
     const SANE_Option_Descriptor *d = real_get_opt(handle, option);
 
-    if (!g_mode || !d || !d->name) return d;
+    if (!d || !d->name) return d;
 
+    /* Always track option numbers for br-x and resolution so that
+     * auto-detect can use them even before long mode is activated.  */
+    if (strcmp(d->name, "br-x") == 0)
+        g_br_x_opt_num = option;
+    else if (strcmp(d->name, "resolution") == 0)
+        g_resolution_opt_num = option;
+
+    /* br-y: track option number and, when long mode is active, extend
+     * the range so frontends can request lengths > the ADF default max. */
     if (strcmp(d->name, "br-y") == 0) {
         g_br_y_opt_num = option;
 
-        if (d->constraint_type == SANE_CONSTRAINT_RANGE &&
+        if (g_mode &&
+            d->constraint_type == SANE_CONSTRAINT_RANGE &&
             d->type == SANE_TYPE_FIXED &&
             d->constraint.range) {
 
@@ -501,7 +547,7 @@ sane_get_option_descriptor(SANE_Handle handle, SANE_Int option) {
             /* Build our extended descriptor once */
             memcpy(&g_br_y_desc,  d,                    sizeof(g_br_y_desc));
             memcpy(&g_br_y_range, d->constraint.range,  sizeof(g_br_y_range));
-            g_br_y_range.max           = SANE_FIX(LONG_PAPER_MAX_MM);
+            g_br_y_range.max             = SANE_FIX(LONG_PAPER_MAX_MM);
             g_br_y_desc.constraint.range = &g_br_y_range;
 
             fprintf(stderr,
@@ -517,16 +563,24 @@ sane_get_option_descriptor(SANE_Handle handle, SANE_Int option) {
 
 /* ── 3. sane_control_option ────────────────────────────────────── */
 /*
- * When the user sets br-y to a value larger than the backend's hard max,
- * we save the requested value (so we could theoretically encode it into
- * the USB scan area) and then pass the backend's own max to prevent
- * SANE_STATUS_INVAL.  The USB patch (above) activates LONG=ON regardless,
- * letting the scanner continue feeding until the document runs out.
+ * Three jobs:
  *
- * NOTE: Some Brother ADS scanners in LONG= mode ignore the scan height
- * and just keep scanning until the document exits the ADF.  If yours
- * stops early, the scan area coordinates in the USB command need adjustment
- * (see protocol_notes.md "Open Questions").
+ *   a) Track resolution and br-x so patch_xsc_area can compute the
+ *      correct pixel ceiling and auto-detect can pick NARROW vs WIDE.
+ *
+ *   b) Auto-detect long mode from br-y when BROTHER_LONG_MODE is not
+ *      set (GUI apps, Simple Scan, etc.).  If br-y > LONG_TRIGGER_MM,
+ *      activate WIDE or NARROW based on the requested scan width.
+ *      When long mode activates here we also extend the br-y range
+ *      descriptor retroactively so the frontend sees the full range if
+ *      it re-queries the option.
+ *
+ *   c) When long mode is active and br-y is being SET, save the
+ *      requested value then push the DS-740D hardware max (1829 mm) to
+ *      the backend so brscan5 allocates a large enough read buffer.
+ *      The backend clamps the stored value, but the USB patches ensure
+ *      the scanner keeps running; the saved g_br_y_user_val is used in
+ *      patch_xsc_area to cap at exactly what the frontend requested.
  */
 SANE_Status sane_control_option(SANE_Handle handle, SANE_Int option,
                                  SANE_Action action, void *value,
@@ -535,16 +589,59 @@ SANE_Status sane_control_option(SANE_Handle handle, SANE_Int option,
 
     if (!real_ctrl_opt) return SANE_STATUS_UNSUPPORTED;
 
+    /* ── a) Track resolution ──────────────────────────────────── */
+    if (action == SANE_ACTION_SET_VALUE &&
+        option == g_resolution_opt_num && value) {
+        /* brscan5 exposes resolution as SANE_TYPE_INT */
+        g_resolution = (int)*(SANE_Int *)value;
+        if (getenv("BROTHER_SCAN_DEBUG"))
+            fprintf(stderr, "[br5longpaper] resolution tracked: %d dpi\n",
+                    g_resolution);
+    }
+
+    /* ── a) Track br-x (width) ────────────────────────────────── */
+    if (action == SANE_ACTION_SET_VALUE &&
+        option == g_br_x_opt_num && value) {
+        g_br_x_user_val = *(SANE_Fixed *)value;
+        if (getenv("BROTHER_SCAN_DEBUG"))
+            fprintf(stderr, "[br5longpaper] br-x tracked: %.1fmm\n",
+                    SANE_UNFIX(g_br_x_user_val));
+    }
+
+    /* ── b) Auto-detect long mode from br-y ───────────────────── */
+    if (!g_mode_explicit &&
+        action == SANE_ACTION_SET_VALUE &&
+        option == g_br_y_opt_num && value) {
+
+        double req_mm = SANE_UNFIX(*(SANE_Fixed *)value);
+
+        if (req_mm > LONG_TRIGGER_MM && g_mode == 0) {
+            /* Pick NARROW if the requested width is receipt-sized */
+            double w_mm = (g_br_x_user_val > 0)
+                          ? SANE_UNFIX(g_br_x_user_val) : 999.0;
+            g_mode = (w_mm < NARROW_WIDTH_MM) ? 2 : 1;
+            fprintf(stderr,
+                "[br5longpaper] auto-detect: br-y=%.1fmm br-x=%.1fmm"
+                " → long mode %s activated\n",
+                req_mm, w_mm, g_mode == 1 ? "WIDE" : "NARROW");
+        } else if (req_mm <= LONG_TRIGGER_MM && g_mode != 0) {
+            fprintf(stderr,
+                "[br5longpaper] auto-detect: br-y=%.1fmm ≤ %.0fmm"
+                " → long mode deactivated\n", req_mm, LONG_TRIGGER_MM);
+            g_mode = 0;
+        }
+    }
+
+    /* ── c) Long-mode br-y SET handler ───────────────────────── */
     if (g_mode && action == SANE_ACTION_SET_VALUE &&
         option == g_br_y_opt_num && value) {
 
         SANE_Fixed requested = *(SANE_Fixed *)value;
-        g_br_y_user_val = requested;
+        g_br_y_user_val = requested;  /* save true requested length */
 
-        /* Always try to push 1829mm (DS-740D hardware max) into the
-         * backend during the option-setup phase.  brscan5 may accept
-         * any value (SANE_STATUS_GOOD) but clamp it internally; the
-         * SANE_INFO_INEXACT flag and a subsequent GET reveal the truth. */
+        /* Push the DS-740D hardware max so brscan5 allocates a full-
+         * length read buffer.  The backend clamps it internally;
+         * patch_xsc_area uses g_br_y_user_val as the actual ceiling.  */
         SANE_Fixed hw_max  = SANE_FIX(1829.0);
         SANE_Int   inf     = 0;
         SANE_Status r = real_ctrl_opt(handle, option, action, &hw_max, &inf);

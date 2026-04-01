@@ -1,9 +1,12 @@
 # Makefile for libbr5longpaper.so
 #
-# Build:    make
-# Install:  make install   (copies to /usr/local/lib)
-# Clean:    make clean
-# Check:    make check-deps
+# Build:             make
+# Install:           make install          (copies .so to /usr/local/lib)
+# System-wide shim:  make install-preload  (adds to /etc/ld.so.preload so all
+#                                           SANE GUI apps use the hook)
+# Remove shim:       make uninstall-preload
+# Clean:             make clean
+# Check:             make check-deps
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -fPIC -shared
@@ -27,7 +30,9 @@ SANE_CFLAGS    := -I/usr/include/sane
 ALL_CFLAGS  = $(CFLAGS) $(LIBUSB_CFLAGS) $(SANE_CFLAGS)
 ALL_LDFLAGS = $(LDFLAGS) $(LIBUSB_LDFLAGS)
 
-.PHONY: all install clean check-deps
+PRELOAD_FILE ?= /etc/ld.so.preload
+
+.PHONY: all install install-preload uninstall-preload clean check-deps
 
 all: $(LIB)
 
@@ -46,9 +51,37 @@ $(LIB): $(SRCS) | check-deps
 install: $(LIB)
 	install -Dm755 $(LIB) $(DESTDIR)$(LIBDIR)/$(LIB)
 	@echo "Installed to $(LIBDIR)/$(LIB)"
-	@echo "To use system-wide:"
-	@echo "  echo $(LIBDIR)/$(LIB) | sudo tee -a /etc/ld.so.preload"
-	@echo "  (Remove from ld.so.preload when not scanning long paper)"
+	@echo ""
+	@echo "To enable for all SANE GUI apps (Simple Scan, GIMP, etc.):"
+	@echo "  make install-preload"
+
+# install-preload — add the .so to /etc/ld.so.preload so every process
+# that links libsane or libusb picks up the hook automatically.  This is
+# what allows GUI scanners (Simple Scan, GIMP, gscan2pdf, etc.) to use
+# long paper mode without needing LD_PRELOAD set manually.
+#
+# Safe to use on single-Brother-scanner setups.  The hook activates long
+# mode only when br-y > 300 mm is requested; all other scans pass through.
+install-preload: install
+	@if grep -qF "$(LIBDIR)/$(LIB)" "$(PRELOAD_FILE)" 2>/dev/null; then \
+	    echo "$(LIBDIR)/$(LIB) is already in $(PRELOAD_FILE) — skipped."; \
+	else \
+	    echo "$(LIBDIR)/$(LIB)" | sudo tee -a "$(PRELOAD_FILE)"; \
+	    echo ""; \
+	    echo "System-wide shim installed."; \
+	    echo "Long paper mode now activates automatically in any SANE app"; \
+	    echo "when br-y > 300 mm is requested (no env vars needed)."; \
+	    echo ""; \
+	    echo "To remove:  make uninstall-preload"; \
+	fi
+
+uninstall-preload:
+	@if grep -qF "$(LIBDIR)/$(LIB)" "$(PRELOAD_FILE)" 2>/dev/null; then \
+	    sudo sed -i "\|$(LIBDIR)/$(LIB)|d" "$(PRELOAD_FILE)"; \
+	    echo "Removed $(LIBDIR)/$(LIB) from $(PRELOAD_FILE)."; \
+	else \
+	    echo "$(LIBDIR)/$(LIB) not found in $(PRELOAD_FILE) — nothing to do."; \
+	fi
 
 clean:
 	rm -f $(LIB)
