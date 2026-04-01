@@ -11,6 +11,17 @@
 #   ./scan_long.sh --resolution 200 --output receipt.pdf
 #   ./scan_long.sh --device "brother5:0x04f9:0x0459:..."
 #
+# Auto-stop behaviour (same as Windows):
+#   The scan ends automatically when the paper exits the ADF — you do NOT
+#   need to know the document length in advance.  The --length value is only
+#   a safety ceiling.  The scanner sends an ALLEND status when the paper
+#   runs out, just like the Windows driver.
+#
+# Hardware maximum lengths:
+#   DS-740D:  72 inches = 1829 mm  (Brother specification)
+#   ADS-1200: verify with your scanner; likely similar
+#   The scanner enforces its own hardware limit regardless of --length.
+#
 # Requirements:
 #   - brscan5 installed (libsane-brother5.so in SANE backend path)
 #   - libbr5longpaper.so built (run 'make' first)
@@ -38,7 +49,8 @@ command -v scanimage >/dev/null 2>&1 || {
 LONG_MODE="WIDE"
 RESOLUTION="300"
 COLOR_MODE="Color"
-LENGTH_MM="2000"          # 2 metres — a generous default long scan
+LENGTH_MM="1830"          # safety ceiling: just above DS-740D's 72" (1829mm) max
+                          # the scan auto-stops on paper-exit — this is just a cap
 DEVICE=""                  # auto-detect if empty
 OUTPUT_FILE="scan_$(date +%Y%m%d_%H%M%S).tiff"
 EXTRA_ARGS=()
@@ -108,7 +120,7 @@ echo "Scanning in LONG PAPER mode (${LONG_MODE})"
 echo "  Device:     ${DEVICE}"
 echo "  Resolution: ${RESOLUTION} DPI"
 echo "  Mode:       ${COLOR_MODE}"
-echo "  Max length: ${LENGTH_MM} mm"
+echo "  Max length: ${LENGTH_MM} mm (scan auto-stops when paper exits ADF)"
 echo "  Output:     ${OUTPUT_FILE}"
 echo ""
 

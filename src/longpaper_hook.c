@@ -237,26 +237,64 @@ static bool is_scan_cmd(const uint8_t *data, int length) {
  *   mode        — 1 = WIDE, 2 = NARROW
  *
  * Returns new length, or -1 on failure (caller should use original).
+ *
+ * What this sets and why:
+ *
+ *   PTYPE=LONGPAPER_WIDE (or NARROW)
+ *     Tells the scanner "this is a long document scan."  The scanner
+ *     switches from coordinate-based stopping to ADF-exit detection:
+ *     it scans until the paper physically exits the feed rollers, then
+ *     sends GetScanStatus()=ALLEND — identical to Windows auto-stop.
+ *
+ *   LONG=ON
+ *     Explicit long-paper enable flag (bool, from MakeLongPaperModeString).
+ *     Redundant with PTYPE=LONGPAPER_* but included for safety.
+ *
+ *   AREA=FULL
+ *     Overrides coordinate-based scan area height ("scan the whole document,
+ *     ignoring the height coordinate").  Without this, the backend clamps
+ *     br-y to ~355mm and encodes that into the scan area coordinates;
+ *     the scanner would stop at 355mm even with LONG=ON set.
+ *     AREA=FULL is most likely what the Windows driver uses for long paper
+ *     because it lets PTYPE/LONG flags drive end-of-scan instead of a fixed
+ *     pixel coordinate.
+ *
+ * Hardware maximums (enforced by the scanner regardless of br-y ceiling):
+ *   DS-740D:  72 inches (1828.8 mm) per Brother specification
+ *   ADS-1200: verify with Windows driver or scanner manual
+ *
+ * The scan auto-stops when paper exits the ADF (ALLEND status), so the
+ * br-y value you pass is only a safety ceiling — identical to Windows.
  */
 static int patch_cmd_long_paper(uint8_t *buf, int len, int max_len,
                                  int mode) {
     const char *ptype = (mode == 1) ? "LONGPAPER_WIDE" : "LONGPAPER_NARROW";
 
-    /* Replace PTYPE= value if present, otherwise insert it */
+    /* Set PTYPE= to the long paper type (replace existing value or insert) */
     int r = buf_replace_val(buf, len, max_len, "PTYPE=", ptype);
-    if (r == -2) return -1;   /* overflow — bail out */
+    if (r == -2) return -1;
     if (r == -1) {
-        /* Key not present: insert */
         len = buf_insert_kv(buf, len, max_len, "PTYPE=", ptype);
         if (len < 0) return -1;
     } else {
         len = r;
     }
 
-    /* Insert LONG=ON if not already set */
+    /* Enable long paper flag */
     r = buf_insert_kv(buf, len, max_len, "LONG=", "ON");
-    if (r < 0 && r != -1 /* -1 = already present */) return -1;
+    if (r < 0 && r != -1) return -1;
     if (r > 0) len = r;
+
+    /* Set AREA=FULL so the scanner uses ADF-exit detection rather than
+     * stopping at the (possibly clamped) coordinate-based height limit. */
+    r = buf_replace_val(buf, len, max_len, "AREA=", "FULL");
+    if (r == -2) return -1;
+    if (r == -1) {
+        len = buf_insert_kv(buf, len, max_len, "AREA=", "FULL");
+        if (len < 0) return -1;
+    } else {
+        len = r;
+    }
 
     return len;
 }
