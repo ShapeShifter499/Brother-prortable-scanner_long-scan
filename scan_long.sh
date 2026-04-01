@@ -48,7 +48,7 @@ command -v scanimage >/dev/null 2>&1 || {
 # ── Defaults ─────────────────────────────────────────────────────
 LONG_MODE="WIDE"
 RESOLUTION="300"
-COLOR_MODE="Color"
+COLOR_MODE="24bit Color[Fast]"
 LENGTH_MM="1830"          # safety ceiling: just above DS-740D's 72" (1829mm) max
                           # the scan auto-stops on paper-exit — this is just a cap
 DEVICE=""                  # auto-detect if empty
@@ -109,8 +109,8 @@ SCAN_ARGS=(
     -o        "${OUTPUT_FILE}"
 )
 
-# ADF source — use center-aligned (standard for ADS-1200 and DS-740D)
-SCAN_ARGS+=(--source "Automatic Document Feeder(center aligned)")
+# ADF source (DS-740D uses left-aligned; ADS-1200 may differ)
+SCAN_ARGS+=(--source "Automatic Document Feeder(left aligned)")
 
 [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && SCAN_ARGS+=("${EXTRA_ARGS[@]}")
 
