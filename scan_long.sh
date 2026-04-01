@@ -141,16 +141,57 @@ if [[ ! -f "${PNM_TMP}" ]]; then
     exit 1
 fi
 
-# ── Convert PNM → requested format ───────────────────────────────
+# ── Convert PNM → requested format (+ auto-trim trailing blank rows) ──────
+#
+# Long paper scans can include blank rows after the paper exits the ADF
+# because brscan5 pads its internal buffer to the pre-configured scan
+# height.  The hook suppresses BitmapImage::AppendWhiteLines in long mode,
+# but as a belt-and-suspenders measure we also trim here with ImageMagick.
+#
+# Trimming strategy: compute the bottom edge of non-white content, then
+# crop from the top of the image to that row only — left/right/top edges
+# are preserved as-is so document margins are not affected.
+# -fuzz 5% handles JPEG compression artifacts at the paper trailing edge.
+
+do_trim_convert() {
+    local src="$1" dst="$2"
+    local conv_cmd
+    if command -v magick >/dev/null 2>&1; then
+        conv_cmd="magick"
+    elif command -v convert >/dev/null 2>&1; then
+        conv_cmd="convert"
+    else
+        return 1
+    fi
+
+    if [[ "${LONG_MODE}" != "OFF" ]]; then
+        local orig_w orig_h bottom
+        orig_w=$("${conv_cmd}" "${src}" -format "%w" info: 2>/dev/null)
+        orig_h=$("${conv_cmd}" "${src}" -format "%h" info: 2>/dev/null)
+        # page.y = top of content after trim; h = height of trimmed content.
+        # page.y + h = bottom row of real content in the original image.
+        bottom=$("${conv_cmd}" "${src}" -fuzz 5% -trim \
+                     -format "%[fx:page.y+h]" info: 2>/dev/null)
+        if [[ "${bottom}" =~ ^[0-9]+$ && "${bottom}" -gt 0 \
+              && "${orig_h}" =~ ^[0-9]+$ && "${bottom}" -lt "${orig_h}" ]]; then
+            local saved=$(( orig_h - bottom ))
+            echo "Trimming trailing blank rows: ${orig_h} → ${bottom} px" \
+                 "(removed ${saved} blank rows /" \
+                 "$(echo "scale=1; ${saved} / ${RESOLUTION} * 25.4" | bc 2>/dev/null || echo '?') mm)"
+            "${conv_cmd}" "${src}" \
+                -gravity North -crop "${orig_w}x${bottom}+0+0" +repage "${dst}"
+            return 0
+        fi
+    fi
+
+    "${conv_cmd}" "${src}" "${dst}"
+}
+
 if [[ "${OUTPUT_FILE}" == *.pnm || "${OUTPUT_FILE}" == *.ppm ]]; then
     mv "${PNM_TMP}" "${OUTPUT_FILE}"
-elif command -v magick >/dev/null 2>&1; then
+elif command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
     echo "Converting to ${OUTPUT_FILE}..."
-    magick "${PNM_TMP}" "${OUTPUT_FILE}"
-    rm -f "${PNM_TMP}"
-elif command -v convert >/dev/null 2>&1; then
-    echo "Converting to ${OUTPUT_FILE}..."
-    convert "${PNM_TMP}" "${OUTPUT_FILE}"
+    do_trim_convert "${PNM_TMP}" "${OUTPUT_FILE}"
     rm -f "${PNM_TMP}"
 else
     # No converter available — keep the PNM

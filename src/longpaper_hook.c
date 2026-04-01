@@ -103,6 +103,9 @@ typedef SANE_Status (*sane_start_fn)(SANE_Handle);
  * passes `this` in rdi and the unsigned int argument in rsi.          */
 typedef void (*cpp_setheight_fn)(void *self, unsigned int h);
 
+/* C++ method type: void BitmapImage::AppendWhiteLines(unsigned int) */
+typedef void (*cpp_appendwhite_fn)(void *self, unsigned int n);
+
 /* ── Globals ───────────────────────────────────────────────────── */
 
 static int  g_mode        = 0;     /* 0=OFF  1=WIDE  2=NARROW       */
@@ -114,8 +117,9 @@ static sane_get_opt_fn    real_get_opt       = NULL;
 static sane_ctrl_fn       real_ctrl_opt      = NULL;
 static sane_get_params_fn real_get_params    = NULL;
 static sane_start_fn      real_sane_start    = NULL;
-static cpp_setheight_fn   real_devimg_sh     = NULL; /* DeviceImageJpeg::SetHeight */
+static cpp_setheight_fn   real_devimg_sh     = NULL; /* DeviceImageJpeg::SetHeight  */
 static cpp_setheight_fn   real_decodeparam_sh= NULL; /* DecodeParameter::SetHeight  */
+static cpp_appendwhite_fn real_append_white  = NULL; /* BitmapImage::AppendWhiteLines */
 
 /* Per-handle tracking of br-y state (single-scanner assumption) */
 static SANE_Fixed  g_br_y_user_val    = 0;  /* what the user requested */
@@ -150,6 +154,8 @@ static void do_init(void) {
                                                     "_ZN15DeviceImageJpeg9SetHeightEj");
     real_decodeparam_sh = (cpp_setheight_fn)   dlsym(RTLD_NEXT,
                                                     "_ZN15DecodeParameter9SetHeightEj");
+    real_append_white   = (cpp_appendwhite_fn) dlsym(RTLD_NEXT,
+                                                    "_ZN11BitmapImage16AppendWhiteLinesEj");
 
     if (g_mode) {
         fprintf(stderr,
@@ -716,4 +722,35 @@ void _ZN15DecodeParameter9SetHeightEj(void *self, unsigned int h) {
         h = 65536;
     }
     if (real_decodeparam_sh) real_decodeparam_sh(self, h);
+}
+
+/* ── 8. BitmapImage::AppendWhiteLines ─────────────────────────────
+ *
+ * After the scanner sends ALLEND (paper-exit signal), brscan5 pads the
+ * internal scan buffer to the pre-configured height by calling this
+ * function.  With our SetHeight hooks raising the limit to 65536 px,
+ * this results in tens of thousands of blank white rows appended after
+ * the actual document content.
+ *
+ * We suppress the call entirely in long paper mode.  The BitmapImage
+ * object then contains only the rows that were received from the scanner,
+ * which is the true document height.  scan_long.sh also runs an
+ * ImageMagick trim step as a belt-and-suspenders fallback in case any
+ * residual blank rows still appear.
+ *
+ * Symbol: _ZN11BitmapImage16AppendWhiteLinesEj
+ *         BitmapImage::AppendWhiteLines(unsigned int)
+ */
+void _ZN11BitmapImage16AppendWhiteLinesEj(void *self, unsigned int n) {
+    if (!real_append_white)
+        real_append_white = (cpp_appendwhite_fn)dlsym(RTLD_NEXT,
+                                "_ZN11BitmapImage16AppendWhiteLinesEj");
+    ensure_init();
+    if (g_mode) {
+        fprintf(stderr,
+            "[br5longpaper] BitmapImage::AppendWhiteLines(%u) suppressed"
+            " (long paper mode — true doc boundary captured via ALLEND)\n", n);
+        return;  /* no-op: do not pad to pre-configured height */
+    }
+    if (real_append_white) real_append_white(self, n);
 }
