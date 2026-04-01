@@ -52,7 +52,7 @@ COLOR_MODE="24bit Color[Fast]"
 LENGTH_MM="1830"          # safety ceiling: just above DS-740D's 72" (1829mm) max
                           # the scan auto-stops on paper-exit — this is just a cap
 DEVICE=""                  # auto-detect if empty
-OUTPUT_FILE="scan_$(date +%Y%m%d_%H%M%S).tiff"
+OUTPUT_FILE="scan_$(date +%Y%m%d_%H%M%S).png"
 EXTRA_ARGS=()
 
 # ── Parse arguments ───────────────────────────────────────────────
@@ -104,7 +104,7 @@ SCAN_ARGS=(
     --device  "${DEVICE}"
     --resolution "${RESOLUTION}"
     --mode    "${COLOR_MODE}"
-    --format  tiff
+    --format  png
     -o        "${OUTPUT_FILE}"
 )
 # Note: DS-740D does not expose --br-y; scan length is determined by the
@@ -132,3 +132,17 @@ LD_PRELOAD="${HOOK_LIB}" \
 
 echo ""
 echo "Scan complete: ${OUTPUT_FILE}"
+
+# Report actual scanned dimensions if identify (ImageMagick) is available
+if command -v identify >/dev/null 2>&1; then
+    INFO=$(identify -ping -format "%wx%h px @ %x dpi\n" "${OUTPUT_FILE}" 2>/dev/null | head -1)
+    if [[ -n "${INFO}" ]]; then
+        echo "Image dimensions: ${INFO}"
+        # Extract height in pixels and convert to inches for confirmation
+        PX_H=$(identify -ping -format "%h" "${OUTPUT_FILE}" 2>/dev/null)
+        if [[ -n "${PX_H}" ]]; then
+            MM_H=$(echo "scale=1; ${PX_H} / ${RESOLUTION} * 25.4" | bc 2>/dev/null || true)
+            [[ -n "${MM_H}" ]] && echo "Scanned length:  ${MM_H} mm  (${PX_H}px at ${RESOLUTION}dpi)"
+        fi
+    fi
+fi
