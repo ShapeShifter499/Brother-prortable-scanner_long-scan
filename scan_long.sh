@@ -100,16 +100,22 @@ if [[ -z "${DEVICE}" ]]; then
 fi
 
 # ── Build scanimage arguments ─────────────────────────────────────
+# scanimage PNG format does not support variable-length (lines=-1) scans.
+# We always scan to a temporary PNM file (which handles variable height
+# by buffering all rows before writing the header), then convert to the
+# requested output format.  The PNM is removed after conversion.
+PNM_TMP="${OUTPUT_FILE%.*}_tmp$$.pnm"
+
 SCAN_ARGS=(
     --device  "${DEVICE}"
     --resolution "${RESOLUTION}"
     --mode    "${COLOR_MODE}"
-    --format  png
-    -o        "${OUTPUT_FILE}"
+    --format  pnm
+    -o        "${PNM_TMP}"
 )
-# Note: DS-740D does not expose --br-y; scan length is determined by the
-# USB-level patch (PTYPE=LONGPAPER_WIDE + LONG=ON + AREA=FULL) and the
-# scanner hardware auto-stops when paper exits the ADF.
+# Note: DS-740D does not expose --br-y via SANE CLI; scan length is
+# controlled by the hook (PTYPE=LONGPAPER_WIDE + LONG=ON + LSMD=ON +
+# sane_start br-y push).  The scanner auto-stops when paper exits ADF.
 
 # ADF source (DS-740D uses left-aligned; ADS-1200 may differ)
 SCAN_ARGS+=(--source "Automatic Document Feeder(left aligned)")
@@ -130,19 +136,42 @@ BROTHER_LONG_MODE="${LONG_MODE}" \
 LD_PRELOAD="${HOOK_LIB}" \
     scanimage "${SCAN_ARGS[@]}"
 
+if [[ ! -f "${PNM_TMP}" ]]; then
+    echo "ERROR: scan produced no output file." >&2
+    exit 1
+fi
+
+# ── Convert PNM → requested format ───────────────────────────────
+if [[ "${OUTPUT_FILE}" == *.pnm || "${OUTPUT_FILE}" == *.ppm ]]; then
+    mv "${PNM_TMP}" "${OUTPUT_FILE}"
+elif command -v convert >/dev/null 2>&1; then
+    echo "Converting to ${OUTPUT_FILE}..."
+    convert "${PNM_TMP}" "${OUTPUT_FILE}"
+    rm -f "${PNM_TMP}"
+elif command -v magick >/dev/null 2>&1; then
+    echo "Converting to ${OUTPUT_FILE}..."
+    magick "${PNM_TMP}" "${OUTPUT_FILE}"
+    rm -f "${PNM_TMP}"
+else
+    # No converter available — keep the PNM
+    PNM_FINAL="${OUTPUT_FILE%.*}.pnm"
+    mv "${PNM_TMP}" "${PNM_FINAL}"
+    echo "NOTE: ImageMagick not found; output kept as ${PNM_FINAL}" >&2
+    echo "      Install ImageMagick to auto-convert:  sudo pacman -S imagemagick" >&2
+    OUTPUT_FILE="${PNM_FINAL}"
+fi
+
 echo ""
 echo "Scan complete: ${OUTPUT_FILE}"
 
-# Report actual scanned dimensions if identify (ImageMagick) is available
+# Report actual scanned dimensions
 if command -v identify >/dev/null 2>&1; then
-    INFO=$(identify -ping -format "%wx%h px @ %x dpi\n" "${OUTPUT_FILE}" 2>/dev/null | head -1)
-    if [[ -n "${INFO}" ]]; then
-        echo "Image dimensions: ${INFO}"
-        # Extract height in pixels and convert to inches for confirmation
-        PX_H=$(identify -ping -format "%h" "${OUTPUT_FILE}" 2>/dev/null)
-        if [[ -n "${PX_H}" ]]; then
-            MM_H=$(echo "scale=1; ${PX_H} / ${RESOLUTION} * 25.4" | bc 2>/dev/null || true)
-            [[ -n "${MM_H}" ]] && echo "Scanned length:  ${MM_H} mm  (${PX_H}px at ${RESOLUTION}dpi)"
-        fi
+    PX_H=$(identify -ping -format "%h" "${OUTPUT_FILE}" 2>/dev/null)
+    PX_W=$(identify -ping -format "%w" "${OUTPUT_FILE}" 2>/dev/null)
+    if [[ -n "${PX_H}" && -n "${PX_W}" ]]; then
+        MM_H=$(echo "scale=1; ${PX_H} / ${RESOLUTION} * 25.4" | bc 2>/dev/null || true)
+        IN_H=$(echo "scale=2; ${PX_H} / ${RESOLUTION}" | bc 2>/dev/null || true)
+        echo "Image dimensions: ${PX_W}×${PX_H} px"
+        [[ -n "${MM_H}" ]] && echo "Scanned length:  ${MM_H} mm (${IN_H} inches) at ${RESOLUTION} DPI"
     fi
 fi

@@ -97,16 +97,19 @@ typedef SANE_Status (*sane_ctrl_fn)(SANE_Handle, SANE_Int, SANE_Action,
 
 typedef SANE_Status (*sane_get_params_fn)(SANE_Handle, SANE_Parameters *);
 
+typedef SANE_Status (*sane_start_fn)(SANE_Handle);
+
 /* ── Globals ───────────────────────────────────────────────────── */
 
 static int  g_mode        = 0;     /* 0=OFF  1=WIDE  2=NARROW       */
 static bool g_initialized = false;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
-static libusb_bulk_fn   real_usb_bulk   = NULL;
-static sane_get_opt_fn  real_get_opt    = NULL;
-static sane_ctrl_fn     real_ctrl_opt   = NULL;
+static libusb_bulk_fn     real_usb_bulk   = NULL;
+static sane_get_opt_fn    real_get_opt    = NULL;
+static sane_ctrl_fn       real_ctrl_opt   = NULL;
 static sane_get_params_fn real_get_params = NULL;
+static sane_start_fn      real_sane_start = NULL;
 
 /* Per-handle tracking of br-y state (single-scanner assumption) */
 static SANE_Fixed  g_br_y_user_val    = 0;  /* what the user requested */
@@ -135,6 +138,8 @@ static void do_init(void) {
                                                   "sane_control_option");
     real_get_params = (sane_get_params_fn) dlsym(RTLD_NEXT,
                                                   "sane_get_parameters");
+    real_sane_start = (sane_start_fn)      dlsym(RTLD_NEXT,
+                                                  "sane_start");
 
     if (g_mode) {
         fprintf(stderr,
@@ -555,9 +560,9 @@ SANE_Status sane_control_option(SANE_Handle handle, SANE_Int option,
  * sends ALLEND — which happens when the paper physically exits the ADF,
  * giving us the same auto-stop behaviour as the Windows driver.
  *
- * Output format note: --format png buffers all rows before writing the
- * PNG header, so it handles lines=-1 correctly.  If you see a truncated
- * or corrupt output, pass --format pnm to get raw PPM and convert later.
+ * Output format: use --format pnm (not png) so scanimage buffers
+ * all rows in a temp file before writing the header.  scan_long.sh
+ * auto-converts to PNG after the scan.
  */
 SANE_Status sane_get_parameters(SANE_Handle handle, SANE_Parameters *params) {
     ensure_init();
@@ -574,4 +579,67 @@ SANE_Status sane_get_parameters(SANE_Handle handle, SANE_Parameters *params) {
     }
 
     return st;
+}
+
+/* ── 5. sane_start ─────────────────────────────────────────────── */
+/*
+ * brscan5 reads all scanner JPEG data during sane_start(), using its
+ * internal scan height (derived from br-y, typically capped at ~355mm =
+ * 4200px at 300dpi).  We must push a larger br-y value into the backend
+ * BEFORE sane_start() is called, so it allocates a bigger read buffer
+ * and continues reading until the scanner's ALLEND signal.
+ *
+ * Strategy:
+ *   Try increasing br-y in 10mm steps from backend_max up to DS-740D's
+ *   hardware maximum (1829mm = 72").  Most values will be rejected with
+ *   SANE_STATUS_INVAL; the first accepted value extends the line budget.
+ *   Any value larger than the document will still produce correct output
+ *   because brscan5 stops at ALLEND (paper exit), not the configured max.
+ *
+ *   If the backend refuses every value above its reported max, we fall
+ *   back to normal behaviour (USB patches still ensure LONGPAPER mode;
+ *   the output may still be capped at 4200 lines in that case).
+ */
+SANE_Status sane_start(SANE_Handle handle) {
+    ensure_init();
+
+    if (!real_sane_start) return SANE_STATUS_UNSUPPORTED;
+
+    if (g_mode && real_ctrl_opt && g_br_y_opt_num >= 0 &&
+        g_br_y_backend_max > 0) {
+
+        /* DS-740D hardware maximum: 72 inches = 1829mm */
+        SANE_Fixed hw_max = SANE_FIX(1829.0);
+        SANE_Fixed target = hw_max;
+        SANE_Int   info   = 0;
+        SANE_Status r;
+
+        /* Try the full 72" first; if rejected, fall back to 500mm
+         * increments down to 50mm above the backend max.             */
+        static const double try_mm[] =
+            { 1829.0, 1500.0, 1200.0, 900.0, 600.0, 0.0 };
+
+        bool pushed = false;
+        for (int i = 0; try_mm[i] > 0.0 && !pushed; i++) {
+            double mm = try_mm[i];
+            if (SANE_FIX(mm) <= g_br_y_backend_max) continue;
+            target = SANE_FIX(mm);
+            r = real_ctrl_opt(handle, g_br_y_opt_num,
+                              SANE_ACTION_SET_VALUE, &target, &info);
+            if (r == SANE_STATUS_GOOD) {
+                fprintf(stderr,
+                    "[br5longpaper] sane_start: br-y pushed to %.0fmm"
+                    " (backend accepted)\n", mm);
+                pushed = true;
+            }
+        }
+        if (!pushed) {
+            fprintf(stderr,
+                "[br5longpaper] sane_start: backend rejected all br-y"
+                " values > %.1fmm; USB patches still active\n",
+                SANE_UNFIX(g_br_y_backend_max));
+        }
+    }
+
+    return real_sane_start(handle);
 }
