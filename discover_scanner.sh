@@ -29,7 +29,7 @@ else
         echo "  0x03b7  ADS-2400N"
         echo "  0x03ba  ADS-3600W"
         echo "  0x03b8  ADS-3000N"
-        echo "  0x????  DS-740D  (PID unknown — match from your lsusb output above)"
+        echo "  0x0469  DS-740D"
     fi
 fi
 

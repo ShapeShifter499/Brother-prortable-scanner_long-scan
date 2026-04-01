@@ -49,7 +49,7 @@
  *   ADS-1200:  0x0459
  *   ADS-1250W: 0x045a
  *   ADS-1700W: 0x045b
- *   DS-740D:   run `lsusb | grep 04f9` to find PID
+ *   DS-740D:   0x0469  (confirmed)
  *
  * Copyright (C) 2026 — Released under GPLv2 (see LICENSE)
  */

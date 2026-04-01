@@ -21,7 +21,7 @@ Reverse-engineered from `brscan5-1.5.1-0` package libraries.
 | ADS-2800W  | 0x03b9 | 315             |
 | ADS-3000N  | 0x03b8 | 319             |
 | ADS-3600W  | 0x03ba | 319             |
-| DS-740D    | ???    | ??? (in encrypted ini) |
+| DS-740D    | 0x0469 | ??? (in encrypted ini) |
 
 The DS-740D is shipped in the same `brscan5-1.5.1-0` package as the ADS-1200
 (same download IDs `dlf104033_000` / `dlf104034_000`), but its entry is in one
