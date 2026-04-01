@@ -95,15 +95,18 @@ typedef const SANE_Option_Descriptor *(*sane_get_opt_fn)(SANE_Handle,
 typedef SANE_Status (*sane_ctrl_fn)(SANE_Handle, SANE_Int, SANE_Action,
                                     void *, SANE_Int *);
 
+typedef SANE_Status (*sane_get_params_fn)(SANE_Handle, SANE_Parameters *);
+
 /* ── Globals ───────────────────────────────────────────────────── */
 
 static int  g_mode        = 0;     /* 0=OFF  1=WIDE  2=NARROW       */
 static bool g_initialized = false;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
-static libusb_bulk_fn  real_usb_bulk   = NULL;
-static sane_get_opt_fn real_get_opt    = NULL;
-static sane_ctrl_fn    real_ctrl_opt   = NULL;
+static libusb_bulk_fn   real_usb_bulk   = NULL;
+static sane_get_opt_fn  real_get_opt    = NULL;
+static sane_ctrl_fn     real_ctrl_opt   = NULL;
+static sane_get_params_fn real_get_params = NULL;
 
 /* Per-handle tracking of br-y state (single-scanner assumption) */
 static SANE_Fixed  g_br_y_user_val    = 0;  /* what the user requested */
@@ -124,12 +127,14 @@ static void do_init(void) {
         else                                      g_mode = 0;
     }
 
-    real_usb_bulk = (libusb_bulk_fn) dlsym(RTLD_NEXT,
-                                            "libusb_bulk_transfer");
-    real_get_opt  = (sane_get_opt_fn) dlsym(RTLD_NEXT,
-                                             "sane_get_option_descriptor");
-    real_ctrl_opt = (sane_ctrl_fn)    dlsym(RTLD_NEXT,
-                                             "sane_control_option");
+    real_usb_bulk   = (libusb_bulk_fn)     dlsym(RTLD_NEXT,
+                                                  "libusb_bulk_transfer");
+    real_get_opt    = (sane_get_opt_fn)    dlsym(RTLD_NEXT,
+                                                  "sane_get_option_descriptor");
+    real_ctrl_opt   = (sane_ctrl_fn)       dlsym(RTLD_NEXT,
+                                                  "sane_control_option");
+    real_get_params = (sane_get_params_fn) dlsym(RTLD_NEXT,
+                                                  "sane_get_parameters");
 
     if (g_mode) {
         fprintf(stderr,
@@ -359,6 +364,18 @@ static int patch_cmd_long_paper(uint8_t *buf, int len, int max_len,
             len = r;
         }
 
+        /* Enable LSMD (Long Scan Mode Detect): scanner uses ADF-exit
+         * detection to stop the scan, same as Windows long paper mode. */
+        r = buf_replace_val(buf, len, max_len, "LSMD=", "ON");
+        if (r == -2) return -1;
+        if (r == -1) {
+            r = buf_insert_kv(buf, len, max_len, "LSMD=", "ON");
+            if (r < 0) return -1;
+            len = r;
+        } else {
+            len = r;
+        }
+
         return len;
     }
 
@@ -521,4 +538,40 @@ SANE_Status sane_control_option(SANE_Handle handle, SANE_Int option,
     }
 
     return real_ctrl_opt(handle, option, action, value, info);
+}
+
+/* ── 4. sane_get_parameters ────────────────────────────────────── */
+/*
+ * brscan5 computes the expected scan height (lines) from br-y, which it
+ * caps at its internal ADF maximum (~355mm = 4200px at 300dpi).  scanimage
+ * calls sane_get_parameters() after sane_start() and uses the returned
+ * lines field as an upper bound for how many rows it will read.  With
+ * lines=4200, scanimage stops at 4200 rows even if the scanner has more
+ * data to send (because we put the scanner in LONGPAPER mode).
+ *
+ * Returning lines=-1 (SANE's "unknown height" sentinel) makes scanimage
+ * switch to a streaming read loop that continues until sane_read() itself
+ * returns SANE_STATUS_EOF.  brscan5 returns EOF only when the scanner
+ * sends ALLEND — which happens when the paper physically exits the ADF,
+ * giving us the same auto-stop behaviour as the Windows driver.
+ *
+ * Output format note: --format png buffers all rows before writing the
+ * PNG header, so it handles lines=-1 correctly.  If you see a truncated
+ * or corrupt output, pass --format pnm to get raw PPM and convert later.
+ */
+SANE_Status sane_get_parameters(SANE_Handle handle, SANE_Parameters *params) {
+    ensure_init();
+
+    if (!real_get_params) return SANE_STATUS_UNSUPPORTED;
+
+    SANE_Status st = real_get_params(handle, params);
+
+    if (st == SANE_STATUS_GOOD && g_mode && params && params->lines > 0) {
+        fprintf(stderr,
+            "[br5longpaper] sane_get_parameters: lines %d → -1"
+            " (streaming until scanner ALLEND)\n", params->lines);
+        params->lines = -1;
+    }
+
+    return st;
 }
