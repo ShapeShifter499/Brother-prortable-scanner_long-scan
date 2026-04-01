@@ -99,17 +99,23 @@ typedef SANE_Status (*sane_get_params_fn)(SANE_Handle, SANE_Parameters *);
 
 typedef SANE_Status (*sane_start_fn)(SANE_Handle);
 
+/* C++ method type: void Class::SetHeight(unsigned int) — x86-64 ABI
+ * passes `this` in rdi and the unsigned int argument in rsi.          */
+typedef void (*cpp_setheight_fn)(void *self, unsigned int h);
+
 /* ── Globals ───────────────────────────────────────────────────── */
 
 static int  g_mode        = 0;     /* 0=OFF  1=WIDE  2=NARROW       */
 static bool g_initialized = false;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
-static libusb_bulk_fn     real_usb_bulk   = NULL;
-static sane_get_opt_fn    real_get_opt    = NULL;
-static sane_ctrl_fn       real_ctrl_opt   = NULL;
-static sane_get_params_fn real_get_params = NULL;
-static sane_start_fn      real_sane_start = NULL;
+static libusb_bulk_fn     real_usb_bulk      = NULL;
+static sane_get_opt_fn    real_get_opt       = NULL;
+static sane_ctrl_fn       real_ctrl_opt      = NULL;
+static sane_get_params_fn real_get_params    = NULL;
+static sane_start_fn      real_sane_start    = NULL;
+static cpp_setheight_fn   real_devimg_sh     = NULL; /* DeviceImageJpeg::SetHeight */
+static cpp_setheight_fn   real_decodeparam_sh= NULL; /* DecodeParameter::SetHeight  */
 
 /* Per-handle tracking of br-y state (single-scanner assumption) */
 static SANE_Fixed  g_br_y_user_val    = 0;  /* what the user requested */
@@ -136,10 +142,14 @@ static void do_init(void) {
                                                   "sane_get_option_descriptor");
     real_ctrl_opt   = (sane_ctrl_fn)       dlsym(RTLD_NEXT,
                                                   "sane_control_option");
-    real_get_params = (sane_get_params_fn) dlsym(RTLD_NEXT,
-                                                  "sane_get_parameters");
-    real_sane_start = (sane_start_fn)      dlsym(RTLD_NEXT,
-                                                  "sane_start");
+    real_get_params     = (sane_get_params_fn) dlsym(RTLD_NEXT,
+                                                    "sane_get_parameters");
+    real_sane_start     = (sane_start_fn)      dlsym(RTLD_NEXT,
+                                                    "sane_start");
+    real_devimg_sh      = (cpp_setheight_fn)   dlsym(RTLD_NEXT,
+                                                    "_ZN15DeviceImageJpeg9SetHeightEj");
+    real_decodeparam_sh = (cpp_setheight_fn)   dlsym(RTLD_NEXT,
+                                                    "_ZN15DecodeParameter9SetHeightEj");
 
     if (g_mode) {
         fprintf(stderr,
@@ -658,4 +668,52 @@ SANE_Status sane_start(SANE_Handle handle) {
     }
 
     return real_sane_start(handle);
+}
+
+/* ── 6 & 7. DeviceImageJpeg::SetHeight / DecodeParameter::SetHeight ───────
+ *
+ * brscan5 computes scan height in pixels from br-y (clamped by capability
+ * table to 355.6mm = 4200px at 300dpi) and calls these two C++ methods in
+ * libLxBsScanCoreApi.so to configure the scan pipeline.  By the time any
+ * SANE-level hook fires, these values are already locked in.
+ *
+ * We intercept the C++ mangled symbols directly via LD_PRELOAD.  When
+ * long-paper mode is active and the height is at or below the capability
+ * cap (< 30 000px = ~100" at 300dpi), we replace it with 65 536px
+ * (~218" at 300dpi, 109" at 600dpi) — well above DS-740D's 72" hardware
+ * max in all cases.  The scanner's own ALLEND (paper-exit) signal stops
+ * the scan at the true document length, so the extra headroom is never
+ * consumed and causes no memory overhead (the buffer grows line-by-line).
+ *
+ * Symbol names (from nm -D libLxBsScanCoreApi.so.3.2.1):
+ *   _ZN15DeviceImageJpeg9SetHeightEj   DeviceImageJpeg::SetHeight(unsigned)
+ *   _ZN15DecodeParameter9SetHeightEj   DecodeParameter::SetHeight(unsigned)
+ */
+
+/* Extend height used by the scanner JPEG capture pipeline. */
+void _ZN15DeviceImageJpeg9SetHeightEj(void *self, unsigned int h) {
+    if (!real_devimg_sh)
+        real_devimg_sh = (cpp_setheight_fn)dlsym(RTLD_NEXT,
+                             "_ZN15DeviceImageJpeg9SetHeightEj");
+    ensure_init();
+    if (g_mode && h > 0 && h < 30000) {
+        fprintf(stderr,
+            "[br5longpaper] DeviceImageJpeg::SetHeight %u → 65536 px\n", h);
+        h = 65536;
+    }
+    if (real_devimg_sh) real_devimg_sh(self, h);
+}
+
+/* Extend height used by the scan-decode / output pipeline. */
+void _ZN15DecodeParameter9SetHeightEj(void *self, unsigned int h) {
+    if (!real_decodeparam_sh)
+        real_decodeparam_sh = (cpp_setheight_fn)dlsym(RTLD_NEXT,
+                                  "_ZN15DecodeParameter9SetHeightEj");
+    ensure_init();
+    if (g_mode && h > 0 && h < 30000) {
+        fprintf(stderr,
+            "[br5longpaper] DecodeParameter::SetHeight %u → 65536 px\n", h);
+        h = 65536;
+    }
+    if (real_decodeparam_sh) real_decodeparam_sh(self, h);
 }
