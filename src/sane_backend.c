@@ -13,22 +13,39 @@
  *
  * How the USB/C++ hooks work without LD_PRELOAD:
  *
- *   1. SANE's dll frontend loads backends with dlopen(RTLD_LOCAL).
- *      A __attribute__((constructor)) immediately promotes our library
- *      to RTLD_GLOBAL using dlopen(RTLD_NOLOAD|RTLD_GLOBAL), placing
- *      our symbols (libusb_bulk_transfer, C++ method overrides) in the
- *      process-wide global symbol table.
+ *   The stock 'brother5' SANE backend is almost always already loaded
+ *   by the time our sane_init runs (dll enumerates backends and pulls
+ *   in libsane-brother5.so.1's NEEDED chain, which loads brscan5 and
+ *   binds its PLT against the system libusb).  A plain dlopen() of
+ *   brscan5 from us would just refcount-bump that existing mapping —
+ *   PLT entries are NOT re-resolved on dlopen of an already-loaded
+ *   library — so any RTLD_GLOBAL promotion of our hook symbols comes
+ *   too late and our interposers never fire.
  *
- *   2. sane_init() loads brscan5 with dlopen(RTLD_NOW|RTLD_GLOBAL).
- *      Because our library is already in the global table, brscan5's
- *      PLT entries for libusb_bulk_transfer, DeviceImageJpeg::SetHeight,
- *      DecodeParameter::SetHeight, and BitmapImage::AppendWhiteLines all
- *      resolve to our hook functions.
+ *   To get a fresh PLT binding we load brscan5 into its OWN link-map
+ *   namespace via dlmopen(LM_ID_NEWLM, …).  Before that we dlmopen
+ *   libbr5longpaper.so into the same fresh namespace.  Because the
+ *   hook lib is the first object loaded in that namespace, when
+ *   brscan5 is then dlmopen'd the dynamic linker searches the hook
+ *   lib first when resolving brscan5's PLT references — so PLT
+ *   entries for libusb_bulk_transfer, DeviceImageJpeg::SetHeight,
+ *   DecodeParameter::SetHeight, and BitmapImage::AppendWhiteLines
+ *   bind to the hook lib's interposers.  (RTLD_GLOBAL is rejected
+ *   by glibc for dlmopen; it isn't needed — first-loaded objects in
+ *   a namespace participate in subsequent intra-namespace symbol
+ *   resolution by default.)  Inside the hooks, dlsym(RTLD_NEXT, …)
+ *   finds the real libusb / brscan5 implementations that the
+ *   namespace also brought in via NEEDED.
  *
- *   3. All sane_* functions are implemented here and delegate to brscan5
- *      via explicit function pointers obtained from dlsym — with our
- *      long paper patches applied inline (extend br-y range, push 1829mm,
- *      lines=-1, NARROW/WIDE detection from br-x).
+ *   All sane_* functions are implemented here and delegate to
+ *   brscan5's sane_* via explicit function pointers obtained from
+ *   dlsym on the new-LM handle — calling across the namespace
+ *   boundary is just a function-pointer call, no special handling
+ *   required.  Long-paper patches (extend br-y range, push 1829mm,
+ *   lines=-1, NARROW/WIDE detection from br-x) are applied here in
+ *   the option layer; the actual USB-protocol bits (PTYPE=LONGPAPER,
+ *   LONG=ON, LSMD=ON) are injected by the hook lib at libusb-transfer
+ *   time inside the new namespace.
  *
  * Build:
  *   See Makefile target 'backend'
@@ -38,6 +55,8 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>      /* Lmid_t, LM_ID_NEWLM, RTLD_DI_LMID */
+#include <limits.h>    /* PATH_MAX */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -350,17 +369,110 @@ void _ZN11BitmapImage16AppendWhiteLinesEj(void *self, unsigned int n)
         } \
     } while (0)
 
+/* Derive the install path of libbr5longpaper.so from our own .so path.
+ * We're installed at <prefix>/lib/sane/libsane-brother5lp.so.1;
+ * the hook lib lives at <prefix>/lib/libbr5longpaper.so. */
+static const char *derive_hook_path(char *buf, size_t buflen)
+{
+    Dl_info info;
+    if (!dladdr((void *)derive_hook_path, &info) || !info.dli_fname)
+        return NULL;
+
+    char self[PATH_MAX];
+    snprintf(self, sizeof(self), "%s", info.dli_fname);
+
+    /* Strip filename, then strip "/sane" if present. */
+    char *slash = strrchr(self, '/');
+    if (!slash) return NULL;
+    *slash = '\0';
+
+    char *tail = strrchr(self, '/');
+    if (tail && strcmp(tail, "/sane") == 0)
+        *tail = '\0';
+
+    snprintf(buf, buflen, "%s/libbr5longpaper.so", self);
+    return buf;
+}
+
 static SANE_Status load_brscan5(void)
 {
     if (g_brscan5) return SANE_STATUS_GOOD;   /* already loaded */
 
-    g_brscan5 = dlopen("libsane-brother5.so.1", RTLD_NOW | RTLD_GLOBAL);
-    if (!g_brscan5) {
-        fprintf(stderr, "[brother5lp] ERROR: cannot load brscan5: %s\n", dlerror());
-        fprintf(stderr, "[brother5lp]   Is the 'brscan5' package installed?\n");
-        return SANE_STATUS_UNSUPPORTED;
+    /* ── Step 1: open the hook lib in a fresh link-map namespace ──
+     * Plain dlopen() in the main namespace would refcount-bump any
+     * already-resident brscan5 (loaded by stock 'brother5' backend)
+     * and never re-resolve its PLT against our hooks.  dlmopen with
+     * LM_ID_NEWLM gives us a completely fresh address space where we
+     * control symbol resolution order. */
+    char hook_buf[PATH_MAX];
+    const char *derived = derive_hook_path(hook_buf, sizeof(hook_buf));
+
+    const char *hook_attempts[] = {
+        derived,
+        "/usr/local/lib/libbr5longpaper.so",
+        "/usr/lib/libbr5longpaper.so",
+        "libbr5longpaper.so",          /* last-resort ld search */
+    };
+
+    void *hook_handle = NULL;
+    Lmid_t lmid = LM_ID_NEWLM;
+    for (size_t i = 0; i < sizeof(hook_attempts)/sizeof(hook_attempts[0]); i++) {
+        if (!hook_attempts[i]) continue;
+        hook_handle = dlmopen(LM_ID_NEWLM, hook_attempts[i],
+                              RTLD_NOW);
+        if (hook_handle) {
+            fprintf(stderr, "[brother5lp] hook lib loaded into fresh LM: %s\n",
+                    hook_attempts[i]);
+            break;
+        }
     }
-    fprintf(stderr, "[brother5lp] loaded brscan5 via dlopen(RTLD_GLOBAL)\n");
+
+    if (!hook_handle) {
+        /* Without the hook lib, long-paper interposition won't work.
+         * Fall back to plain dlopen — the device still appears and
+         * br-y option-layer patching still happens, but firmware
+         * will likely still jam past 14 inches.  Warn loudly. */
+        fprintf(stderr, "[brother5lp] WARNING: dlmopen libbr5longpaper.so"
+                " failed: %s\n", dlerror());
+        fprintf(stderr, "[brother5lp]   Long-paper USB protocol patches"
+                " will NOT be applied.\n");
+        g_brscan5 = dlopen("libsane-brother5.so.1", RTLD_NOW | RTLD_GLOBAL);
+        if (!g_brscan5) {
+            fprintf(stderr, "[brother5lp] ERROR: cannot load brscan5: %s\n",
+                    dlerror());
+            fprintf(stderr, "[brother5lp]   Is the 'brscan5' package installed?\n");
+            return SANE_STATUS_UNSUPPORTED;
+        }
+        fprintf(stderr, "[brother5lp] loaded brscan5 via dlopen"
+                " (no hooks — fallback path)\n");
+    } else {
+        /* ── Step 2: load brscan5 into the SAME fresh LM as the hook lib.
+         * Because libbr5longpaper.so was loaded first in this LM, the
+         * dynamic linker searches it when resolving brscan5's PLT
+         * entries — so libusb_bulk_transfer and the C++ method
+         * overrides bind to the hook lib's interposers. */
+        if (dlinfo(hook_handle, RTLD_DI_LMID, &lmid) != 0) {
+            fprintf(stderr, "[brother5lp] ERROR: dlinfo(RTLD_DI_LMID) failed: %s\n",
+                    dlerror());
+            return SANE_STATUS_UNSUPPORTED;
+        }
+
+        g_brscan5 = dlmopen(lmid, "libsane-brother5.so.1", RTLD_NOW);
+        if (!g_brscan5) {
+            /* Brother installs into /usr/lib/sane which isn't on the
+             * default ld.so search path; try absolute. */
+            g_brscan5 = dlmopen(lmid, "/usr/lib/sane/libsane-brother5.so.1",
+                                RTLD_NOW);
+        }
+        if (!g_brscan5) {
+            fprintf(stderr, "[brother5lp] ERROR: cannot dlmopen brscan5: %s\n",
+                    dlerror());
+            fprintf(stderr, "[brother5lp]   Is the 'brscan5' package installed?\n");
+            return SANE_STATUS_UNSUPPORTED;
+        }
+        fprintf(stderr, "[brother5lp] loaded brscan5 in fresh LM"
+                " (hooks active via dlmopen)\n");
+    }
 
     B5_LOAD(b5_init,       "sane_init");
     B5_LOAD(b5_exit,       "sane_exit");
