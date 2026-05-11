@@ -629,3 +629,30 @@ SANE_String_Const sane_strstatus(SANE_Status status)
 {
     return b5_strstatus ? b5_strstatus(status) : "unknown status";
 }
+
+/* ── SANE dll entry-point aliases ─────────────────────────────────────
+ *
+ * libsane's dll dispatcher loads each backend via dlopen() and then
+ * looks up sane_<backendname>_<op> — not plain sane_<op>.  Without
+ * these aliases, dll loads libsane-brother5lp.so.1 successfully,
+ * finds zero matching symbols ("unable to find _sane_brother5lp_init"
+ * × 13 in SANE_DEBUG_DLL=5), and silently disables the backend so
+ * no [Long Paper] device ever appears in scanimage -L.
+ *
+ * Each alias adds a sane_brother5lp_* symbol that points at the
+ * existing sane_* implementation — no runtime cost, no behaviour
+ * change for callers that dlsym the plain names.
+ */
+extern __typeof(sane_init)                  sane_brother5lp_init                  __attribute__((alias("sane_init")));
+extern __typeof(sane_exit)                  sane_brother5lp_exit                  __attribute__((alias("sane_exit")));
+extern __typeof(sane_get_devices)           sane_brother5lp_get_devices           __attribute__((alias("sane_get_devices")));
+extern __typeof(sane_open)                  sane_brother5lp_open                  __attribute__((alias("sane_open")));
+extern __typeof(sane_close)                 sane_brother5lp_close                 __attribute__((alias("sane_close")));
+extern __typeof(sane_get_option_descriptor) sane_brother5lp_get_option_descriptor __attribute__((alias("sane_get_option_descriptor")));
+extern __typeof(sane_control_option)        sane_brother5lp_control_option        __attribute__((alias("sane_control_option")));
+extern __typeof(sane_get_parameters)        sane_brother5lp_get_parameters        __attribute__((alias("sane_get_parameters")));
+extern __typeof(sane_start)                 sane_brother5lp_start                 __attribute__((alias("sane_start")));
+extern __typeof(sane_read)                  sane_brother5lp_read                  __attribute__((alias("sane_read")));
+extern __typeof(sane_cancel)                sane_brother5lp_cancel                __attribute__((alias("sane_cancel")));
+extern __typeof(sane_set_io_mode)           sane_brother5lp_set_io_mode           __attribute__((alias("sane_set_io_mode")));
+extern __typeof(sane_get_select_fd)         sane_brother5lp_get_select_fd         __attribute__((alias("sane_get_select_fd")));
