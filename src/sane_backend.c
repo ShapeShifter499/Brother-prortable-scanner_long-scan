@@ -65,22 +65,21 @@
 #include <pthread.h>
 
 #include <sane/sane.h>
-#include <libusb-1.0/libusb.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
 #define LONG_PAPER_MAX_MM  5000.0   /* exposed br-y max (mm) */
 #define NARROW_WIDTH_MM     110.0   /* br-x below this → NARROW mode */
-#define MAX_CMD_BUF        8192
 
 /* ── Types ──────────────────────────────────────────────────────── */
 
-typedef int  (*libusb_bulk_fn)(libusb_device_handle *, unsigned char,
-                                unsigned char *, int, int *, unsigned int);
-typedef void (*cpp_setheight_fn)(void *, unsigned int);
-typedef void (*cpp_appendwhite_fn)(void *, unsigned int);
-
-/* brscan5 SANE function pointer types */
+/* brscan5 SANE function pointer types.
+ *
+ * NOTE: the actual USB/C++ interposition lives entirely in
+ * libbr5longpaper.so, which load_brscan5() pulls into a fresh
+ * dlmopen namespace ahead of brscan5.  This file is purely the SANE
+ * wrapper; it deliberately defines no interposers of its own so that
+ * nothing leaks into the main link namespace. */
 typedef SANE_Status          (*fn_init)      (SANE_Int *, SANE_Auth_Callback);
 typedef void                  (*fn_exit)      (void);
 typedef SANE_Status          (*fn_get_devs)  (const SANE_Device ***, SANE_Bool);
@@ -118,13 +117,6 @@ static fn_set_io     b5_set_io      = NULL;
 static fn_get_fd     b5_get_fd      = NULL;
 static fn_strstatus  b5_strstatus   = NULL;
 
-/* ── Hook function pointers (lazily resolved via RTLD_NEXT) ─────── */
-
-static libusb_bulk_fn     real_usb_bulk       = NULL;
-static cpp_setheight_fn   real_devimg_sh      = NULL;
-static cpp_setheight_fn   real_decodeparam_sh = NULL;
-static cpp_appendwhite_fn real_append_white   = NULL;
-
 /* ── Per-session scan state ─────────────────────────────────────── */
 
 static int        g_mode             = 1;   /* 1=WIDE, 2=NARROW; always ON for this backend */
@@ -139,222 +131,6 @@ static SANE_Int   g_res_opt_num      = -1;
 /* Extended br-y option descriptor */
 static SANE_Option_Descriptor g_br_y_desc;
 static SANE_Range              g_br_y_range;
-
-/* ── Constructor: promote to RTLD_GLOBAL ────────────────────────── */
-/*
- * SANE's dll frontend calls dlopen("libsane-brother5lp.so.1", RTLD_LOCAL).
- * We need our symbols in the global table BEFORE brscan5 is loaded so that
- * brscan5's PLT bindings for libusb_bulk_transfer and the C++ methods
- * resolve to our hooks.  dlopen with (RTLD_NOLOAD|RTLD_GLOBAL) on an
- * already-resident library promotes it from local to global scope.
- * We find our own path via dladdr so no filename is hard-coded.
- */
-__attribute__((constructor))
-static void br5lp_promote_global(void)
-{
-    Dl_info info;
-    if (dladdr((void *)br5lp_promote_global, &info) && info.dli_fname) {
-        void *h = dlopen(info.dli_fname, RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
-        if (h)
-            fprintf(stderr, "[brother5lp] promoted to RTLD_GLOBAL\n");
-        else
-            fprintf(stderr, "[brother5lp] WARNING: RTLD_GLOBAL promotion"
-                    " failed: %s\n", dlerror());
-    }
-}
-
-/* ══════════════════════════════════════════════════════════════════
- * USB command patching (mirrors longpaper_hook.c; kept self-contained)
- * ════════════════════════════════════════════════════════════════ */
-
-static uint8_t *buf_find(const uint8_t *hay, int hlen, const char *needle)
-{
-    int nlen = (int)strlen(needle);
-    for (int i = 0; i <= hlen - nlen; i++)
-        if (memcmp(hay + i, needle, nlen) == 0)
-            return (uint8_t *)(hay + i);
-    return NULL;
-}
-
-static int buf_replace_val(uint8_t *buf, int len, int max_len,
-                            const char *key, const char *new_val)
-{
-    uint8_t *p = buf_find(buf, len, key);
-    if (!p) return -1;
-    uint8_t *vs = p + strlen(key);
-    uint8_t *ve = vs;
-    while (ve < buf + len && *ve != '\r' && *ve != '\n' && *ve != '\0') ve++;
-    int olen = (int)(ve - vs), nlen = (int)strlen(new_val), delta = nlen - olen;
-    if (len + delta > max_len) return -2;
-    memmove(vs + nlen, ve, (buf + len) - ve);
-    memcpy(vs, new_val, nlen);
-    return len + delta;
-}
-
-static int buf_insert_kv(uint8_t *buf, int len, int max_len,
-                          const char *key, const char *val)
-{
-    if (buf_find(buf, len, key)) return len;
-    char token[128];
-    int tlen = snprintf(token, sizeof(token), "%s%s\r\n", key, val);
-    if (tlen <= 0 || tlen >= (int)sizeof(token) || len + tlen > max_len) return -1;
-    int ins = (len > 0 && buf[len - 1] == 0x80) ? len - 1 : len;
-    memmove(buf + ins + tlen, buf + ins, len - ins);
-    memcpy(buf + ins, token, tlen);
-    return len + tlen;
-}
-
-static bool cmd_is(const uint8_t *buf, int len, const char *hdr)
-{
-    int hlen = (int)strlen(hdr);
-    return len >= hlen && memcmp(buf, hdr, hlen) == 0;
-}
-
-static bool is_scan_cmd(const uint8_t *data, int length)
-{
-    if (length < 6 || length > MAX_CMD_BUF) return false;
-    return cmd_is(data, length, "\x1bSSP\n") || cmd_is(data, length, "\x1bXSC\n");
-}
-
-static int patch_xsc_area(uint8_t *buf, int len, int max_len)
-{
-    uint8_t *p = buf_find(buf, len, "AREA=");
-    if (!p) return len;
-    uint8_t *vs = p + 5, *ve = vs;
-    while (ve < buf + len && *ve != '\r' && *ve != '\n' && *ve != '\0') ve++;
-    int vlen = (int)(ve - vs);
-    if (vlen <= 0 || vlen >= 64) return len;
-    char val[64]; memcpy(val, vs, vlen); val[vlen] = '\0';
-    long x1, y1, x2, y2;
-    if (sscanf(val, "%ld,%ld,%ld,%ld", &x1, &y1, &x2, &y2) != 4) return len;
-
-    long y2_new;
-    if (g_br_y_user_val > 0) {
-        double mm = SANE_UNFIX(g_br_y_user_val);
-        long calc  = (long)(mm / 25.4 * g_resolution + 0.5);
-        y2_new = (calc < 999999) ? calc : 999999;
-        fprintf(stderr, "[brother5lp] XSC AREA y2: %ld → %ld (%.1fmm @ %ddpi)\n",
-                y2, y2_new, mm, g_resolution);
-    } else {
-        y2_new = 999999;
-        fprintf(stderr, "[brother5lp] XSC AREA y2: %ld → %ld (scanner ALLEND)\n",
-                y2, y2_new);
-    }
-
-    char newval[64];
-    int nvlen = snprintf(newval, sizeof(newval), "%ld,%ld,%ld,%ld", x1, y1, x2, y2_new);
-    int delta = nvlen - vlen;
-    if (len + delta > max_len) return -1;
-    memmove(vs + nvlen, ve, (buf + len) - ve);
-    memcpy(vs, newval, nvlen);
-    return len + delta;
-}
-
-static int patch_cmd_long_paper(uint8_t *buf, int len, int max_len, int mode)
-{
-    if (cmd_is(buf, len, "\x1bXSC\n"))
-        return patch_xsc_area(buf, len, max_len);
-
-    if (cmd_is(buf, len, "\x1bSSP\n")) {
-        const char *ptype = (mode == 2) ? "LONGPAPER_NARROW" : "LONGPAPER_WIDE";
-        int r = buf_replace_val(buf, len, max_len, "PTYPE=", ptype);
-        if (r == -2) return -1;
-        if (r == -1) { len = buf_insert_kv(buf, len, max_len, "PTYPE=", ptype); if (len < 0) return -1; }
-        else len = r;
-
-        r = buf_replace_val(buf, len, max_len, "LONG=", "ON");
-        if (r == -2) return -1;
-        if (r == -1) { r = buf_insert_kv(buf, len, max_len, "LONG=", "ON"); if (r < 0) return -1; len = r; }
-        else len = r;
-
-        r = buf_replace_val(buf, len, max_len, "LSMD=", "ON");
-        if (r == -2) return -1;
-        if (r == -1) { r = buf_insert_kv(buf, len, max_len, "LSMD=", "ON"); if (r < 0) return -1; len = r; }
-        else len = r;
-
-        return len;
-    }
-    return len;
-}
-
-/* ══════════════════════════════════════════════════════════════════
- * Hook functions — libusb + C++ methods
- *
- * These are in the global symbol table (via br5lp_promote_global).
- * When brscan5 is subsequently loaded with RTLD_GLOBAL, its PLT
- * entries for these symbols bind to our versions here.
- *
- * RTLD_NEXT finds the real implementations because brscan5's
- * dependencies (libusb, libLxBsScanCoreApi) are loaded AFTER us.
- * ════════════════════════════════════════════════════════════════ */
-
-int libusb_bulk_transfer(libusb_device_handle *dev_handle,
-                          unsigned char endpoint,
-                          unsigned char *data, int length,
-                          int *actual_length, unsigned int timeout)
-{
-    if (!real_usb_bulk)
-        real_usb_bulk = (libusb_bulk_fn)dlsym(RTLD_NEXT, "libusb_bulk_transfer");
-
-    if (!(endpoint & LIBUSB_ENDPOINT_IN) && is_scan_cmd(data, length)) {
-        int extra = 256;
-        uint8_t *mod = malloc(length + extra);
-        if (mod) {
-            memcpy(mod, data, length);
-            int new_len = patch_cmd_long_paper(mod, length, length + extra, g_mode);
-            if (new_len > 0) {
-                const char *ct = cmd_is(mod, length, "\x1bSSP\n") ? "SSP" : "XSC";
-                fprintf(stderr, "[brother5lp] USB patch %s: LONGPAPER_%s (%d→%d bytes)\n",
-                        ct, g_mode == 2 ? "NARROW" : "WIDE", length, new_len);
-                int rc = real_usb_bulk(dev_handle, endpoint, mod,
-                                       new_len, actual_length, timeout);
-                free(mod);
-                return rc;
-            }
-            free(mod);
-        }
-    }
-
-    return real_usb_bulk
-           ? real_usb_bulk(dev_handle, endpoint, data, length, actual_length, timeout)
-           : LIBUSB_ERROR_OTHER;
-}
-
-/* Extend height in scan pipeline beyond brscan5's ADF cap (4200px / 355mm) */
-void _ZN15DeviceImageJpeg9SetHeightEj(void *self, unsigned int h)
-{
-    if (!real_devimg_sh)
-        real_devimg_sh = (cpp_setheight_fn)dlsym(RTLD_NEXT,
-                             "_ZN15DeviceImageJpeg9SetHeightEj");
-    if (h > 0 && h < 30000) {
-        fprintf(stderr, "[brother5lp] DeviceImageJpeg::SetHeight %u → 65536\n", h);
-        h = 65536;
-    }
-    if (real_devimg_sh) real_devimg_sh(self, h);
-}
-
-void _ZN15DecodeParameter9SetHeightEj(void *self, unsigned int h)
-{
-    if (!real_decodeparam_sh)
-        real_decodeparam_sh = (cpp_setheight_fn)dlsym(RTLD_NEXT,
-                                  "_ZN15DecodeParameter9SetHeightEj");
-    if (h > 0 && h < 30000) {
-        fprintf(stderr, "[brother5lp] DecodeParameter::SetHeight %u → 65536\n", h);
-        h = 65536;
-    }
-    if (real_decodeparam_sh) real_decodeparam_sh(self, h);
-}
-
-/* Suppress white-row padding after ALLEND — only real scan data remains */
-void _ZN11BitmapImage16AppendWhiteLinesEj(void *self, unsigned int n)
-{
-    if (!real_append_white)
-        real_append_white = (cpp_appendwhite_fn)dlsym(RTLD_NEXT,
-                                "_ZN11BitmapImage16AppendWhiteLinesEj");
-    fprintf(stderr,
-        "[brother5lp] BitmapImage::AppendWhiteLines(%u) suppressed\n", n);
-    /* no-op — caller does not get white padding rows */
-}
 
 /* ══════════════════════════════════════════════════════════════════
  * brscan5 loading
@@ -397,6 +173,15 @@ static const char *derive_hook_path(char *buf, size_t buflen)
 static SANE_Status load_brscan5(void)
 {
     if (g_brscan5) return SANE_STATUS_GOOD;   /* already loaded */
+
+    /* The hook lib decides whether to patch from BROTHER_LONG_MODE, read
+     * once (lazily) at its first interposed call.  In this backend path
+     * the hook lib's own SANE option hooks never fire (we call brscan5's
+     * sane_* directly via b5_*), so without this seed its mode would stay
+     * OFF and no long-paper patches would apply.  Seed a WIDE default now;
+     * sane_start() refines it to NARROW when a receipt-width br-x is set.
+     * overwrite=0 lets a user-exported value (or scan-long) win. */
+    setenv("BROTHER_LONG_MODE", "WIDE", 0);
 
     /* ── Step 1: open the hook lib in a fresh link-map namespace ──
      * Plain dlopen() in the main namespace would refcount-bump any
@@ -697,9 +482,19 @@ SANE_Status sane_get_parameters(SANE_Handle handle, SANE_Parameters *params)
 
 SANE_Status sane_start(SANE_Handle handle)
 {
+    /* Refine the hook lib's mode from the br-x-derived decision before any
+     * scan USB traffic flows.  The hook lib reads BROTHER_LONG_MODE lazily
+     * at its first interposed libusb_bulk_transfer (inside b5_start below),
+     * so setting it here lands in time for the first scan.  NOTE: the hook
+     * lib latches its mode once per process (pthread_once), so for multiple
+     * scans in one long-lived frontend the first scan's mode sticks. */
+    setenv("BROTHER_LONG_MODE", g_mode == 2 ? "NARROW" : "WIDE", 1);
+
     /* Push the hardware maximum to brscan5 right before starting so it
-     * allocates the largest possible read buffer.  patch_xsc_area then
-     * caps the AREA y2 at the value actually requested by the frontend. */
+     * allocates the largest possible read buffer.  The scan itself stops
+     * on the scanner's ALLEND (paper-exit) signal — the hook lib widens
+     * the XSC area ceiling so the firmware's auto-stop governs the length,
+     * matching the Windows long-paper behaviour. */
     if (g_br_y_opt_num >= 0 && g_br_y_backend_max > 0) {
         SANE_Fixed hw  = SANE_FIX(1829.0);
         SANE_Int   inf = 0;
